@@ -20,12 +20,20 @@ import { SimWorld } from './world'
 // no linear damping (bodyFactory.ts) and Jolt's default angular damping, so a free spin decays by k on every axis
 // about a fixed axis. A drum rolling without slipping shares that damping with its linear motion through the contact,
 // so it decays by 1 - c * dt * I / (I + m R^2), a third of c for a solid cylinder.
+//
+// An impact's time can be recovered from inside its step by intersecting the line the body came in on with the one it
+// leaves on. When the gap at the start of the contact step is within Jolt's speculative contact distance, the solver
+// stops the body at the wall face in that step and the intercept is the contact time to a few microseconds. When it
+// is not, the body sinks into the wall, is pushed out over several steps, and rests the penetration slop deep, so the
+// intercept is late by that slop over the speed.
 
 const Jolt = await initJolt()
 
 const HZ = 100
 const DT = 1 / HZ
 const G = 9.81
+/** the resting penetration world.ts gives Jolt (PENETRATION_SLOP), m */
+const PENETRATION_SLOP = 0.005
 /** Jolt's default angular damping, which cargo keeps, per second */
 const ANGULAR_DAMPING = 0.05
 
@@ -76,6 +84,46 @@ function stepOnAxis(a: Sample, b: Sample, axis: 0 | 1 | 2): { dv: number; newVel
     newVelResidual: dx - v1 * DT,
     meanVelResidual: dx - ((v0 + v1) / 2) * DT,
     twoSampleJerk: (12 * (((v0 + v1) / 2) * DT - dx)) / DT ** 3,
+  }
+}
+
+/**
+ * A box flying along +x at `speed` into a static wall placed so the box reaches it `phase` of the way through its
+ * eighth step, with the impact's time recovered from the samples alone: the line in through the last sample before
+ * the velocity changed, the line out from the first sample from which the body moves steadily by its velocity again.
+ */
+function wallImpact(speed: number, phase: number): { contact: number; intercept: number; window: number; restDepth: number } {
+  const hx = 0.15
+  const w = new SimWorld(Jolt, { version: SCENE_VERSION, parts: [] }, { hz: HZ })
+  try {
+    const contact = (7 + phase) * DT
+    const face = hx + speed * contact
+    ;(w as unknown as { bodies: { addStaticBox(...a: number[]): unknown } }).bodies.addStaticBox(0.05, 20, 3, face + 0.05, 50, 0, 0, 0.5)
+    const id = w.spawnBoxAt(0, 50, 0, hx, 0.1, 0.15)
+    const body = liveBody(w, (b) => b.id === id)
+    const v = new Jolt.Vec3(speed, 0, 0)
+    bodyInterface(w).SetLinearVelocity(body.GetID(), v)
+    Jolt.destroy(v)
+    // x is untouched by gravity, so before the wall the box moves at `speed` exactly
+    const x = [0]
+    const vx = [speed]
+    for (let n = 1; n <= 60; n++) {
+      w.step()
+      x.push(body.GetPosition().GetX())
+      vx.push(body.GetLinearVelocity().GetX())
+    }
+    let n = 1
+    while (Math.abs(vx[n]! - speed) < 1e-3) n++
+    const steady = (m: number): boolean => Math.abs(vx[m + 1]! - vx[m]!) < 1e-3 && [1, 2].every((k) => Math.abs(x[m + k]! - x[m + k - 1]! - vx[m + k]! * DT) < 1e-5)
+    let m = n + 1
+    while (!steady(m)) m++
+    const tIn = (n - 1) * DT
+    const tOut = m * DT
+    const vOut = vx[m + 1]!
+    const intercept = (x[m]! - x[n - 1]! + speed * tIn - vOut * tOut) / (speed - vOut)
+    return { contact, intercept, window: m - n + 1, restDepth: x[m]! - (face - hx) }
+  } finally {
+    w.dispose()
   }
 }
 
@@ -265,5 +313,28 @@ describe('how a Jolt step moves a cargo body', () => {
     for (const a of slipAlpha) expect(a).toBeCloseTo(slipAlpha[0]!, 4)
     for (const d of slipDecel) expect(d).toBeCloseTo(slipDecel[0]!, 4)
     expect(rolled).toBeGreaterThan(5 * HZ)
+  })
+
+  it('a wall impact caught by a speculative contact is timed by the line intercept to within 0.1 ms', () => {
+    // the gap at the start of the contact step is at most 1.5 cm in each of these
+    for (const [speed, phase] of [[0.5, 0.25], [0.5, 0.5], [0.5, 0.75], [2, 0.25], [2, 0.5], [2, 0.75], [5, 0.25]] as const) {
+      const hit = wallImpact(speed, phase)
+      expect(hit.window, `${speed} m/s at ${phase}`).toBeLessThanOrEqual(3)
+      expect(Math.abs(hit.restDepth), `${speed} m/s at ${phase}`).toBeLessThan(2e-4)
+      expect(Math.abs(hit.intercept - hit.contact), `${speed} m/s at ${phase}`).toBeLessThan(1e-4)
+    }
+  })
+
+  it('a fast impact past the speculative distance sinks in by the slop, so its intercept is late by slop / speed', () => {
+    // 5 m/s covers 5 cm a step: the gap at the start of the contact step is 2.5 and 3.75 cm
+    for (const phase of [0.5, 0.75]) {
+      const hit = wallImpact(5, phase)
+      // pushed out over several steps, which the residual flags, to rest inside the face
+      expect(hit.window, `phase ${phase}`).toBeGreaterThan(5)
+      expect(hit.restDepth, `phase ${phase}`).toBeCloseTo(PENETRATION_SLOP, 4)
+      expect(hit.intercept - hit.contact, `phase ${phase}`).toBeCloseTo(PENETRATION_SLOP / 5, 4)
+      // and taking the slop off the rest position gives the contact time back
+      expect(Math.abs(hit.intercept - PENETRATION_SLOP / 5 - hit.contact), `phase ${phase}`).toBeLessThan(1e-4)
+    }
   })
 })
