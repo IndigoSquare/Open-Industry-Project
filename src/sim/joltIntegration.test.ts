@@ -25,13 +25,17 @@ import { SimWorld } from './world'
 // leaves on. When the gap at the start of the contact step is within Jolt's speculative contact distance, the solver
 // stops the body at the wall face in that step and the intercept is the contact time to a few microseconds. When it
 // is not, the body sinks into the wall, is pushed out over several steps, and rests the penetration slop deep, so the
-// intercept is late by that slop over the speed.
+// intercept is late by that slop over the speed. Two boxes meeting do the same at their closing speed. A glancing hit is
+// timed by its normal axis; the wall's friction slows the tangential one over the contact step and the next, so the
+// tangential lines cross a little early.
 
 const Jolt = await initJolt()
 
 const HZ = 100
 const DT = 1 / HZ
 const G = 9.81
+/** the half length along x of the boxes the impact tests fly */
+const BOX_HX = 0.15
 /** the resting penetration world.ts gives Jolt (PENETRATION_SLOP), m */
 const PENETRATION_SLOP = 0.005
 /** Jolt's default angular damping, which cargo keeps, per second */
@@ -88,40 +92,68 @@ function stepOnAxis(a: Sample, b: Sample, axis: 0 | 1 | 2): { dv: number; newVel
 }
 
 /**
- * A box flying along +x at `speed` into a static wall placed so the box reaches it `phase` of the way through its
- * eighth step, with the impact's time recovered from the samples alone: the line in through the last sample before
- * the velocity changed, the line out from the first sample from which the body moves steadily by its velocity again.
+ * When one axis of a body's motion changed, from its samples alone: the line in through the last sample before the
+ * velocity changed, the line out from the first sample from which the body moves steadily by its velocity again, and
+ * where they cross. `window` counts the steps between them, `out` is the index of the first steady sample.
  */
+function crossing(x: readonly number[], v: readonly number[], vIn: number): { time: number; window: number; out: number } {
+  let n = 1
+  while (Math.abs(v[n]! - vIn) < 1e-3) n++
+  const steady = (m: number): boolean => Math.abs(v[m + 1]! - v[m]!) < 1e-3 && [1, 2].every((k) => Math.abs(x[m + k]! - x[m + k - 1]! - v[m + k]! * DT) < 1e-5)
+  let m = n + 1
+  while (!steady(m)) m++
+  const tIn = (n - 1) * DT
+  const tOut = m * DT
+  const vOut = v[m + 1]!
+  return { time: (x[m]! - x[n - 1]! + vIn * tIn - vOut * tOut) / (vIn - vOut), window: m - n + 1, out: m }
+}
+
+/** a world with nothing in it but what the test adds, high above the floor; `wall` adds a static box */
+function emptyWorld(): { world: SimWorld; wall(hx: number, hy: number, hz: number, x: number, y: number, z: number): void } {
+  const world = new SimWorld(Jolt, { version: SCENE_VERSION, parts: [] }, { hz: HZ })
+  const bodies = (world as unknown as { bodies: { addStaticBox(hx: number, hy: number, hz: number, x: number, y: number, z: number, rotY: number, friction: number): unknown } }).bodies
+  return { world, wall: (hx, hy, hz, x, y, z) => void bodies.addStaticBox(hx, hy, hz, x, y, z, 0, 0.5) }
+}
+
+/** a 0.3 x 0.2 x 0.3 m box at (x, 50, 0) moving at `v`, and its body */
+function flyingBox(world: SimWorld, x: number, v: [number, number, number]): JoltType.Body {
+  const id = world.spawnBoxAt(x, 50, 0, BOX_HX, 0.1, 0.15)
+  const body = liveBody(world, (b) => b.id === id)
+  const vel = new Jolt.Vec3(v[0], v[1], v[2])
+  bodyInterface(world).SetLinearVelocity(body.GetID(), vel)
+  Jolt.destroy(vel)
+  return body
+}
+
+/** each body's x and z positions and velocities over `steps` steps, with the start as sample 0 */
+function trace(world: SimWorld, bodies: readonly JoltType.Body[], steps: number): { x: number[]; vx: number[]; z: number[]; vz: number[] }[] {
+  const out = bodies.map((b) => ({ x: [b.GetPosition().GetX()], vx: [b.GetLinearVelocity().GetX()], z: [b.GetPosition().GetZ()], vz: [b.GetLinearVelocity().GetZ()] }))
+  for (let n = 0; n < steps; n++) {
+    world.step()
+    bodies.forEach((b, i) => {
+      const p = b.GetPosition()
+      const v = b.GetLinearVelocity()
+      out[i]!.x.push(p.GetX())
+      out[i]!.vx.push(v.GetX())
+      out[i]!.z.push(p.GetZ())
+      out[i]!.vz.push(v.GetZ())
+    })
+  }
+  return out
+}
+
+/** A box flying along +x at `speed` into a static wall placed so the box reaches it `phase` of the way through its
+ *  eighth step, and the impact as `crossing` finds it. */
 function wallImpact(speed: number, phase: number): { contact: number; intercept: number; window: number; restDepth: number } {
-  const hx = 0.15
-  const w = new SimWorld(Jolt, { version: SCENE_VERSION, parts: [] }, { hz: HZ })
+  const { world: w, wall } = emptyWorld()
   try {
     const contact = (7 + phase) * DT
-    const face = hx + speed * contact
-    ;(w as unknown as { bodies: { addStaticBox(...a: number[]): unknown } }).bodies.addStaticBox(0.05, 20, 3, face + 0.05, 50, 0, 0, 0.5)
-    const id = w.spawnBoxAt(0, 50, 0, hx, 0.1, 0.15)
-    const body = liveBody(w, (b) => b.id === id)
-    const v = new Jolt.Vec3(speed, 0, 0)
-    bodyInterface(w).SetLinearVelocity(body.GetID(), v)
-    Jolt.destroy(v)
+    const face = BOX_HX + speed * contact
+    wall(0.05, 20, 3, face + 0.05, 50, 0)
     // x is untouched by gravity, so before the wall the box moves at `speed` exactly
-    const x = [0]
-    const vx = [speed]
-    for (let n = 1; n <= 60; n++) {
-      w.step()
-      x.push(body.GetPosition().GetX())
-      vx.push(body.GetLinearVelocity().GetX())
-    }
-    let n = 1
-    while (Math.abs(vx[n]! - speed) < 1e-3) n++
-    const steady = (m: number): boolean => Math.abs(vx[m + 1]! - vx[m]!) < 1e-3 && [1, 2].every((k) => Math.abs(x[m + k]! - x[m + k - 1]! - vx[m + k]! * DT) < 1e-5)
-    let m = n + 1
-    while (!steady(m)) m++
-    const tIn = (n - 1) * DT
-    const tOut = m * DT
-    const vOut = vx[m + 1]!
-    const intercept = (x[m]! - x[n - 1]! + speed * tIn - vOut * tOut) / (speed - vOut)
-    return { contact, intercept, window: m - n + 1, restDepth: x[m]! - (face - hx) }
+    const [t] = trace(w, [flyingBox(w, 0, [speed, 0, 0])], 60)
+    const hit = crossing(t!.x, t!.vx, speed)
+    return { contact, intercept: hit.time, window: hit.window, restDepth: t!.x[hit.out]! - (face - BOX_HX) }
   } finally {
     w.dispose()
   }
@@ -335,6 +367,64 @@ describe('how a Jolt step moves a cargo body', () => {
       expect(hit.intercept - hit.contact, `phase ${phase}`).toBeCloseTo(PENETRATION_SLOP / 5, 4)
       // and taking the slop off the rest position gives the contact time back
       expect(Math.abs(hit.intercept - PENETRATION_SLOP / 5 - hit.contact), `phase ${phase}`).toBeLessThan(1e-4)
+    }
+  })
+
+  it('two boxes meeting are timed like a wall, each from its own samples, late by slop / closing speed when uncaught', () => {
+    for (const [speed, phase] of [[0.5, 0.25], [0.5, 0.75], [2, 0.5], [3, 0.5], [5, 0.25], [3, 0.75], [5, 0.5], [5, 0.75]] as const) {
+      const { world: w } = emptyWorld()
+      try {
+        const contact = (7 + phase) * DT
+        const caught = speed * phase * DT <= 0.02 // the gap at the start of the contact step, against the speculative distance
+        const a = flyingBox(w, 0, [speed, 0, 0])
+        const b = flyingBox(w, 2 * BOX_HX + speed * contact, [0, 0, 0])
+        const [ta, tb] = trace(w, [a, b], 60)
+        const hitA = crossing(ta!.x, ta!.vx, speed)
+        const hitB = crossing(tb!.x, tb!.vx, 0)
+        const label = `${speed} m/s at ${phase}`
+        // equal masses with no restitution leave together at half the speed
+        expect(ta!.vx[hitA.out + 1]!, label).toBeCloseTo(speed / 2, 3)
+        expect(tb!.vx[hitB.out + 1]!, label).toBeCloseTo(speed / 2, 3)
+        expect(Math.abs(hitA.time - hitB.time), label).toBeLessThan(1e-5)
+        const late = caught ? 0 : PENETRATION_SLOP / speed
+        expect(Math.abs(hitA.time - late - contact), label).toBeLessThan(1e-4)
+        if (caught) expect(hitA.window, label).toBe(2)
+        else expect(hitA.window, label).toBeGreaterThan(5)
+        // and they rest touching, or overlapping by the slop
+        const overlap = 2 * BOX_HX - (tb!.x[60]! - ta!.x[60]!)
+        expect(overlap, label).toBeCloseTo(caught ? 0 : PENETRATION_SLOP, 4)
+      } finally {
+        w.dispose()
+      }
+    }
+  })
+
+  it('a glancing hit is timed by its normal axis; friction slows the tangential one over two steps, so it crosses early', () => {
+    for (const speed of [0.5, 2]) {
+      for (const angle of [30, 60, 75]) {
+        for (const phase of [0.25, 0.75]) {
+          const { world: w, wall } = emptyWorld()
+          try {
+            const rad = (angle * Math.PI) / 180
+            const vx = speed * Math.cos(rad)
+            const vz = speed * Math.sin(rad)
+            const contact = (7 + phase) * DT
+            wall(0.05, 20, 20, BOX_HX + vx * contact + 0.05, 50, 0)
+            const [t] = trace(w, [flyingBox(w, 0, [vx, 0, vz])], 60)
+            const label = `${speed} m/s at ${angle} deg, ${phase}`
+            const normal = crossing(t!.x, t!.vx, vx)
+            expect(Math.abs(normal.time - contact), label).toBeLessThan(1e-4)
+            // the tangential speed drops in the contact step and again in the next
+            expect(t!.vz[8]!, label).toBeLessThan(vz - 1e-3)
+            expect(t!.vz[9]!, label).toBeLessThan(t!.vz[8]! - 1e-3)
+            const tangential = crossing(t!.z, t!.vz, vz)
+            expect(tangential.time - contact, label).toBeLessThan(0)
+            expect(tangential.time - contact, label).toBeGreaterThan(-5e-4)
+          } finally {
+            w.dispose()
+          }
+        }
+      }
     }
   })
 })
