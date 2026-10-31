@@ -1,0 +1,173 @@
+import initJolt from 'jolt-physics'
+import { afterEach, describe, expect, it } from 'vitest'
+import { clearPackages, registerPackage } from '../core/parts/partRegistry'
+import { PACKAGE_FORMAT } from '../core/parts/partPackage'
+import type { PartPackage } from '../core/parts/partPackage'
+import { SCENE_VERSION } from '../core/types'
+import type { SdkPart } from '../core/types'
+import { SimWorld } from './world'
+
+// How one Jolt step moves a cargo body, read from the samples an export would carry: position and linear velocity
+// after each step. Jolt sets the new velocity first and then moves the body by it (semi-implicit Euler), so
+// x1 = x0 + v1 * dt, not x0 + (v0 + v1) / 2 * dt. Within one step the position therefore says nothing the new
+// velocity does not, and an analysis that reads a step's position change as constant-acceleration motion sees a
+// jerk of -6 * dv / dt^2 that is not there. Acceleration takes two samples (dv / dt) and jerk three.
+
+const Jolt = await initJolt()
+
+const HZ = 100
+const DT = 1 / HZ
+const G = 9.81
+
+interface Sample {
+  pos: [number, number, number]
+  vel: [number, number, number]
+}
+
+/** the body's centre and linear velocity after the last step, found by its frame id */
+function sample(world: SimWorld, id: number): Sample {
+  const f = world.frame()
+  const v = world.cargoVelocities()
+  const i = Array.from(f.ids).indexOf(id)
+  const j = Array.from(v.ids).indexOf(id)
+  if (i < 0 || j < 0) throw new Error(`body ${id} is not in the frame`)
+  return {
+    pos: [f.positions[i * 3]!, f.positions[i * 3 + 1]!, f.positions[i * 3 + 2]!],
+    vel: [v.velocities[j * 3]!, v.velocities[j * 3 + 1]!, v.velocities[j * 3 + 2]!],
+  }
+}
+
+function record(world: SimWorld, id: number, steps: number): Sample[] {
+  const out = [sample(world, id)]
+  for (let n = 0; n < steps; n++) {
+    world.step()
+    out.push(sample(world, id))
+  }
+  return out
+}
+
+/** One step on one axis: the position change against the two integration rules, and the two-sample jerk that
+ *  assumes constant acceleration within the step. */
+function stepOnAxis(a: Sample, b: Sample, axis: 0 | 1 | 2): { dv: number; newVelResidual: number; meanVelResidual: number; twoSampleJerk: number } {
+  const dx = b.pos[axis] - a.pos[axis]
+  const v0 = a.vel[axis]
+  const v1 = b.vel[axis]
+  return {
+    dv: v1 - v0,
+    newVelResidual: dx - v1 * DT,
+    meanVelResidual: dx - ((v0 + v1) / 2) * DT,
+    twoSampleJerk: (12 * (((v0 + v1) / 2) * DT - dx)) / DT ** 3,
+  }
+}
+
+/** a flat 4 m belt along +x that runs at `speed` from sim time `from` on */
+function runningBelt(speed: number, from: number): PartPackage {
+  const params = {
+    segments: { type: 'numberList', arity: 2, default: [[4, 0]], handle: { kind: 'path', lengthCol: 0, tiltCol: 1 } },
+    width: { type: 'number', default: 0.6 },
+    height: { type: 'number', default: 0.17 },
+  }
+  const step = `const s = ctx.simTime >= ${from} ? ${speed} : 0; ctx.setSurfaceVelocity({ x: ctx.forward.x * s, y: 0, z: ctx.forward.z * s })`
+  return {
+    format: PACKAGE_FORMAT,
+    id: 'test.running-belt',
+    name: 'Running Belt',
+    conveyor: { bed: 'path', surface: 'belt' },
+    params,
+    behavior: `definePart({ params: ${JSON.stringify(params)}, step(ctx) { ${step} } })`,
+    geometry: { kind: 'drawn', bounds: { length: 4, width: 0.6, top: 0.17 }, conveys: true },
+  } as unknown as PartPackage
+}
+
+/** a box dropped from 0.15 m above a belt at the origin, which runs at 0.5 m/s from sim time `from` */
+function boxOnBelt(from: number): { world: SimWorld; id: number } {
+  registerPackage(runningBelt(0.5, from))
+  const belt = { id: 'belt', type: 'part', packageId: 'test.running-belt', position: [0, 1, 0], rotationY: 0, params: {} } as unknown as SdkPart
+  const world = new SimWorld(Jolt, { version: SCENE_VERSION, parts: [belt] }, { hz: HZ })
+  return { world, id: world.spawnBoxAt(0.5, 1.25, 0, 0.15, 0.1, 0.15) }
+}
+
+describe('how a Jolt step moves a cargo body', () => {
+  let world: SimWorld | null = null
+  afterEach(() => {
+    world?.dispose()
+    world = null
+    clearPackages()
+  })
+
+  it('in free fall the position moves by the new velocity, and a constant gravity reads as no jerk only over three samples', () => {
+    world = new SimWorld(Jolt, { version: SCENE_VERSION, parts: [] }, { hz: HZ })
+    const id = world.spawnBoxAt(20, 5, 20, 0.15, 0.1, 0.15)
+    const samples = record(world, id, 20)
+
+    for (let n = 1; n < samples.length; n++) {
+      const y = stepOnAxis(samples[n - 1]!, samples[n]!, 1)
+      expect(y.dv).toBeCloseTo(-G * DT, 5)
+      // the new-velocity rule holds to float32 rounding; the mean-velocity rule is off by dv * dt / 2 (0.5 mm here)
+      expect(Math.abs(y.newVelResidual)).toBeLessThan(1e-5)
+      expect(y.meanVelResidual).toBeCloseTo((y.dv * DT) / 2, 5)
+      // so the two-sample estimate reports 6 g / dt (about 5900 m/s^3) of jerk where there is none
+      expect(y.twoSampleJerk).toBeCloseTo((-6 * y.dv) / DT ** 2, -1)
+      expect(Math.abs(y.twoSampleJerk)).toBeGreaterThan(5000)
+      // no force acts on x or z
+      for (const axis of [0, 2] as const) {
+        const s = stepOnAxis(samples[n - 1]!, samples[n]!, axis)
+        expect(s.dv).toBe(0)
+        expect(Math.abs(s.newVelResidual)).toBeLessThan(1e-6)
+      }
+    }
+
+    // over three samples the jerk of a constant acceleration is zero to float32 rounding
+    for (let n = 2; n < samples.length; n++) {
+      const jerk = (samples[n]!.vel[1] - 2 * samples[n - 1]!.vel[1] + samples[n - 2]!.vel[1]) / DT ** 2
+      expect(Math.abs(jerk)).toBeLessThan(1)
+    }
+  })
+
+  it('a belt starting under a resting box speeds it up at a constant rate: a ramp, moved by the new velocity', () => {
+    const run = boxOnBelt(1)
+    world = run.world
+    const samples = record(world, run.id, 2 * HZ)
+
+    // the belt carries the box up to its own speed
+    expect(samples[samples.length - 1]!.vel[0]).toBeCloseTo(0.5, 3)
+
+    const ramp: number[] = [] // the sample index after each accelerating step
+    for (let n = 1; n < samples.length; n++) {
+      const x = stepOnAxis(samples[n - 1]!, samples[n]!, 0)
+      expect(Math.abs(x.newVelResidual)).toBeLessThan(1e-5)
+      if (x.dv > 1e-3) {
+        ramp.push(n)
+        expect(x.meanVelResidual).toBeCloseTo((x.dv * DT) / 2, 5)
+      }
+    }
+    // friction drives it over several steps, each adding the same speed, less than gravity would
+    expect(ramp.length).toBeGreaterThan(3)
+    const accel = ramp.map((n) => (samples[n]!.vel[0] - samples[n - 1]!.vel[0]) / DT)
+    for (const a of accel.slice(0, -1)) expect(a).toBeCloseTo(accel[0]!, 1)
+    expect(accel[0]!).toBeGreaterThan(1)
+    expect(accel[0]!).toBeLessThan(G)
+    // inside the ramp the three-sample jerk is zero and the two-sample one is not
+    for (const n of ramp.slice(1, -2)) {
+      const jerk = (samples[n + 1]!.vel[0] - 2 * samples[n]!.vel[0] + samples[n - 1]!.vel[0]) / DT ** 2
+      expect(Math.abs(jerk)).toBeLessThan(1)
+      expect(Math.abs(stepOnAxis(samples[n - 1]!, samples[n]!, 0).twoSampleJerk)).toBeGreaterThan(1000)
+    }
+  })
+
+  it('a box landing on a running belt takes the belt speed in about one step: an impulse', () => {
+    const run = boxOnBelt(0)
+    world = run.world
+    const samples = record(world, run.id, HZ)
+
+    expect(samples[samples.length - 1]!.vel[0]).toBeCloseTo(0.5, 3)
+    let biggest = 0
+    for (let n = 1; n < samples.length; n++) {
+      const x = stepOnAxis(samples[n - 1]!, samples[n]!, 0)
+      expect(Math.abs(x.newVelResidual)).toBeLessThan(1e-5)
+      biggest = Math.max(biggest, x.dv)
+    }
+    // the landing's normal impulse lets friction give most of the 0.5 m/s in a single step
+    expect(biggest).toBeGreaterThan(0.4)
+  })
+})
