@@ -1,10 +1,13 @@
 import initJolt from 'jolt-physics'
+import type JoltType from 'jolt-physics'
 import { afterEach, describe, expect, it } from 'vitest'
 import { clearPackages, registerPackage } from '../core/parts/partRegistry'
 import { PACKAGE_FORMAT } from '../core/parts/partPackage'
-import type { PartPackage } from '../core/parts/partPackage'
+import type { PackageManifest, PartPackage } from '../core/parts/partPackage'
+import { createSdkPart } from '../core/scene/scene'
 import { SCENE_VERSION } from '../core/types'
 import type { SdkPart } from '../core/types'
+import { buildPackage } from './buildPackage'
 import { SimWorld } from './world'
 
 // How one Jolt step moves a cargo body, read from the samples an export would carry: position and linear velocity
@@ -12,12 +15,28 @@ import { SimWorld } from './world'
 // x1 = x0 + v1 * dt, not x0 + (v0 + v1) / 2 * dt. Within one step the position therefore says nothing the new
 // velocity does not, and an analysis that reads a step's position change as constant-acceleration motion sees a
 // jerk of -6 * dv / dt^2 that is not there. Acceleration takes two samples (dv / dt) and jerk three.
+//
+// Damping scales the velocity by k = 1 - c * dt after the step's forces are added: v1 = k * (v0 + a * dt). Cargo has
+// no linear damping (bodyFactory.ts) and Jolt's default angular damping, so a free spin decays by k on every axis
+// about a fixed axis. A drum rolling without slipping shares that damping with its linear motion through the contact,
+// so it decays by 1 - c * dt * I / (I + m R^2), a third of c for a solid cylinder.
 
 const Jolt = await initJolt()
 
 const HZ = 100
 const DT = 1 / HZ
 const G = 9.81
+/** Jolt's default angular damping, which cargo keeps, per second */
+const ANGULAR_DAMPING = 0.05
+
+interface LiveBody {
+  id: number
+  partId: string | null
+  body: JoltType.Body
+}
+const liveBody = (w: SimWorld, match: (b: LiveBody) => boolean): JoltType.Body => (w as unknown as { boxes: LiveBody[] }).boxes.find(match)!.body
+const bodyInterface = (w: SimWorld): JoltType.BodyInterface => (w as unknown as { bodyInterface: JoltType.BodyInterface }).bodyInterface
+const vec = (v: JoltType.Vec3): [number, number, number] => [v.GetX(), v.GetY(), v.GetZ()]
 
 interface Sample {
   pos: [number, number, number]
@@ -169,5 +188,82 @@ describe('how a Jolt step moves a cargo body', () => {
     }
     // the landing's normal impulse lets friction give most of the 0.5 m/s in a single step
     expect(biggest).toBeGreaterThan(0.4)
+  })
+
+  it('a free spin decays by k = 1 - c * dt on every axis about a fixed axis, and forces are added before damping', () => {
+    world = new SimWorld(Jolt, { version: SCENE_VERSION, parts: [] }, { hz: HZ })
+    const id = world.spawnBoxAt(20, 50, 20, 0.15, 0.1, 0.25)
+    const body = liveBody(world, (b) => b.id === id)
+    const motion = body.GetMotionProperties()
+    expect(motion.GetLinearDamping()).toBe(0)
+    expect(motion.GetAngularDamping()).toBeCloseTo(ANGULAR_DAMPING, 6)
+    // linear damping on this one body, to see where it falls against gravity in the step
+    motion.SetLinearDamping(0.05)
+    // a spin off every principal axis of an unequal box, which would precess if the step had a gyroscopic term
+    const spin = new Jolt.Vec3(3, 5, -2)
+    bodyInterface(world).SetAngularVelocity(body.GetID(), spin)
+    Jolt.destroy(spin)
+
+    const k = 1 - ANGULAR_DAMPING * DT
+    let w0 = [3, 5, -2]
+    let vy0 = 0
+    for (let n = 0; n < 50; n++) {
+      world.step()
+      const w1 = vec(body.GetAngularVelocity())
+      for (let i = 0; i < 3; i++) expect(w1[i]! / w0[i]!).toBeCloseTo(k, 6)
+      const vy1 = body.GetLinearVelocity().GetY()
+      expect(vy1).toBeCloseTo(k * (vy0 - G * DT), 6) // forces first, then damping
+      expect(Math.abs(vy1 - (k * vy0 - G * DT))).toBeGreaterThan(4e-5) // not damping first
+      w0 = w1
+      vy0 = vy1
+    }
+  })
+
+  it('a shoved drum slips at a constant rate, then rolls and decays by 1 - c * dt / 3 in both v and omega', () => {
+    const R = 0.29
+    const manifest: PackageManifest = {
+      id: 'test.drum-side',
+      name: 'Drum',
+      geometry: { kind: 'rig', links: [{ name: 'shell', shape: { kind: 'cylinder', radius: R, height: 0.88 }, offset: [0, 0, 0], rotation: [0, 0, Math.PI / 2] }], joints: [] },
+      cargo: { friction: 0.5 },
+    }
+    const drum = buildPackage(manifest, "definePart({ params: { mass: { type: 'number', default: 20 }, color: { type: 'color', default: '#2a5d8f' } }, step() {} })")
+    registerPackage(drum)
+    world = new SimWorld(Jolt, { version: SCENE_VERSION, parts: [createSdkPart(drum, 'drum', [0, R + 0.01, 0], 0)], packages: [drum] }, { hz: HZ })
+    for (let n = 0; n < HZ; n++) world.step() // settle on the floor
+    const body = liveBody(world, (b) => b.partId === 'drum')
+    const shove = new Jolt.Vec3(0, 0, 2)
+    bodyInterface(world).SetLinearVelocity(body.GetID(), shove)
+    bodyInterface(world).ResetSleepTimer(body.GetID()) // or a body that rested half a second sleeps within the step
+    Jolt.destroy(shove)
+
+    const k = 1 - ANGULAR_DAMPING * DT
+    const rolling = 1 - (ANGULAR_DAMPING * DT) / 3 // I / (I + m R^2) = 1/3 for a solid cylinder
+    let w0 = 0
+    let v0 = 2
+    const slipAlpha: number[] = []
+    const slipDecel: number[] = []
+    let rolled = 0
+    for (let n = 0; n < 10 * HZ; n++) {
+      world.step()
+      const w1 = body.GetAngularVelocity().GetX()
+      const v1 = body.GetLinearVelocity().GetZ()
+      if (Math.abs(v1 - w1 * R) > 1e-3) {
+        // slipping: friction is a constant force, so v falls linearly and omega follows k * (omega + alpha * dt)
+        slipAlpha.push(w1 / k - w0)
+        slipDecel.push(v1 - v0)
+      } else if (w0 > 0 && Math.abs(v0 - w0 * R) < 1e-3) {
+        // rolling: no constant torque; both decay geometrically at a third of the free-spin rate
+        expect(w1 / w0).toBeCloseTo(rolling, 6)
+        expect(v1 / v0).toBeCloseTo(rolling, 6)
+        rolled++
+      }
+      w0 = w1
+      v0 = v1
+    }
+    expect(slipAlpha.length).toBeGreaterThan(5)
+    for (const a of slipAlpha) expect(a).toBeCloseTo(slipAlpha[0]!, 4)
+    for (const d of slipDecel) expect(d).toBeCloseTo(slipDecel[0]!, 4)
+    expect(rolled).toBeGreaterThan(5 * HZ)
   })
 })
