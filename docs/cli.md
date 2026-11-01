@@ -150,6 +150,10 @@ Never hand-edit scene.json; these go through the same checks the editor does.
   could not run. `--only` takes an exact file or test name and falls back to a substring only when nothing matches
   exactly; `--cargo 5,10` lists where every box is at those times, with its tilt, heading, velocity and what it touches. Prefer `passed` + `color` probes, tag-vs-tag
   checks and `from`/`until` windows over exact counts at exact times: [project-tests.md](project-tests.md).
+- **`npm run motion-export -- <project-folder> --out <file|-> [--duration N] [--only <test>] [--batch <steps>]`** -
+  every moving cargo body's pose and Jolt velocities at every physics step of the project's run, in binary batches
+  for an outside analyser; `--out -` streams to stdout. Exit 3 = the project failed to load or the run could not
+  start. The format: [motion-export.md](motion-export.md).
 - **`npm run check-flow -- <project-folder> [--seconds N] [--input Tag=v@t] [--json]`** - what physically happened on
   the line: boxes dropped or lost, tipped, eye flickers with the tags that toggled, boxes still on a running
   conveyor. These are facts, never verdicts: a row former's stall is normal accumulation. `test-project` prints the

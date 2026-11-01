@@ -34,7 +34,7 @@ PLCs) built in TypeScript / three.js / Jolt-physics. It also ships a native surf
 | Dev on prod assets | `OIP_DEV_PROD_ASSETS=1 npm run dev` (serves `/models` + `/textures` from `dist/`) |
 | ST oracles | `npm run st-oracle` (MATIEC) · `st-oracle:ed3` (STruC++) · `st-oracle:xml` · `st-oracle:openplc` · `st-oracle:dry`; on Windows `wsl -u root -- bash scripts/oracle-wsl.sh all` |
 | PLC in the loop | `npm run openplc-loop` (OpenPLC over Modbus TCP) · `npm run openplc-loop:cells` (OpenPLC as a second controller beside the program) · `npm run s7-loop` (snap7 over S7) |
-| Headless CLIs | `catalog`, `check-part`, `add-part`, `edit-part`, `duplicate-parts`, `rename-tag`, `assign-io`, `snap-part`, `shot-part`, `inspect-glb`, `import-model`, `validate-project`, `check-st`, `check-wiring`, `check-layout`, `test-project`, `check-flow`, `bench-sim`, `capabilities`, `build-part-sdk`, `build-parts`, `build-library`, `sign-library`, `library-key`, `check-submission`, `library-corpus`, `bake-walls`, `sdk-usage`, `retired-kinds` |
+| Headless CLIs | `catalog`, `check-part`, `add-part`, `edit-part`, `duplicate-parts`, `rename-tag`, `assign-io`, `snap-part`, `shot-part`, `inspect-glb`, `import-model`, `validate-project`, `check-st`, `check-wiring`, `check-layout`, `test-project`, `motion-export`, `check-flow`, `bench-sim`, `capabilities`, `build-part-sdk`, `build-parts`, `build-library`, `sign-library`, `library-key`, `check-submission`, `library-corpus`, `bake-walls`, `sdk-usage`, `retired-kinds` |
 
 The headless CLIs, the oracles and the PLC loops are documented in [docs/cli.md](docs/cli.md): no browser, real exit
 codes, the door an agent or a pre-commit hook uses. Never hand-edit a project's scene.json; use `add-part` /

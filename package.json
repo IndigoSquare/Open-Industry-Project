@@ -32,6 +32,7 @@
     "thumbnails": "node scripts/gen-thumbnails.mjs",
     "validate-project": "node scripts/validate-project.mjs",
     "test-project": "node scripts/test-project.mjs",
+    "motion-export": "node scripts/motion-export.mjs",
     "check-flow": "node scripts/check-flow.mjs",
     "bench-sim": "node scripts/bench-sim.mjs",
     "check-st": "node scripts/check-st.mjs",

@@ -72,6 +72,8 @@ import { RigDriver } from './rigDriver'
 import { SensorRegistry } from './sensorRegistry'
 import { LoadCells } from './loadCells'
 import { cargoContacts } from './cargoContacts'
+import { MotionSamples } from './motionSamples'
+import type { MotionStepView } from '../core/motion/motionExport'
 import { behaviorRecord, marksOf, partPackageRev, partSignature } from './worldTypes'
 import type { BehaviorRecord, BodyHolder, JoltModule, KinematicScratch, LiveBox, PartGroup, RigBody, StepClock, UnitLoad } from './worldTypes'
 
@@ -141,6 +143,8 @@ export class SimWorld implements SimCore<BoxFrame> {
   private readonly cargo: CargoRegistry
   /** who holds each cargo body, and the pilot's carry (bodyHolds.ts) */
   private readonly holds: BodyHolds
+  /** the per-step velocities and state the motion export reads (motionSamples.ts), its buffers kept between steps */
+  private readonly motion = new MotionSamples()
   /**
    * Read-only views of what the two owners above keep, for the step loops here and for tests that look inside the
    * world (unitLoad, palletDispenser, stretchWrapper, ... reach `boxes`, `units` and `holders` through a cast):
@@ -1255,6 +1259,12 @@ export class SimWorld implements SimCore<BoxFrame> {
    *  collision query per body. */
   cargoContacts(): Map<number, string[]> {
     return cargoContacts(this.J, { system: this.system, boxes: this.boxes, groups: this.bodies.groups, ground: this.bodies.ground })
+  }
+
+  /** Each cargo row's Jolt velocities and sleep/hold/unit state this step, index-aligned with frame(), for the motion
+   *  export (core/motion/motionExport.ts). The view is reused: read it before the next call. */
+  motionStep(): MotionStepView {
+    return this.motion.read({ boxes: this.boxes, holders: this.holders, bodyInterface: this.bodyInterface })
   }
 
   /** Each cargo row's frame id and linear velocity in m/s (x, y, z), index-aligned with frame(). A unit load's pieces

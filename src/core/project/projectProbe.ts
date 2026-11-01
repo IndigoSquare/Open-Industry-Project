@@ -17,6 +17,7 @@
 import { cargoKindName } from '../frame'
 import type { BoxFrame, CargoKindName } from '../frame'
 import { quatToYXZ } from '../math'
+import type { MotionStepView } from '../motion/motionExport'
 import { isOperand, operandProbeKey, probeKey } from './projectTest'
 import type { CargoColor, CargoColorName, CountProbe, JointProbe, LampProbe, MarkFilter, PassedProbe, PoseProbe, SquareProbe, TestCheck, TestProbe, TestValue, Zone } from './projectTest'
 
@@ -238,6 +239,9 @@ export interface CargoSnapshotRow extends CargoRow {
 export interface FrameExtras {
   /** by frame id, what each cargo body touched in the step (sim/cargoContacts.ts) */
   contacts?: () => ReadonlyMap<number, readonly string[]>
+  /** each cargo row's Jolt velocities and sleep/hold/unit state this step, index-aligned with the frame (the motion
+   *  export, core/motion/motionExport.ts); reused, so read it before the next step */
+  motion?: () => MotionStepView
 }
 
 /** The live cargo at one asked-for time: `at` is the time asked for, `t` the first step that reached it. */
