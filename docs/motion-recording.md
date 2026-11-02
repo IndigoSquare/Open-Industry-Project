@@ -301,7 +301,7 @@ rest or riding a belt steadily costs its 148-byte row and nothing else.
    reel's end has its records to the first step at or after that end in the reel, so its last interval can be drawn
    without the next reel. Loading a reel is one read of its index bytes and one read per type.
 4. **A body not listed is not in the world** for the whole reel.
-5. **A reel is never larger than the cap**, counting its index bytes and its records before compression, except a
+5. **A reel is never larger than its cap**, counting its index bytes and its records before compression, except a
    reel of a single step whose keys alone exceed it.
 
 ### When a reel closes
@@ -326,7 +326,7 @@ whatever the cap. The reel table records each reel's cap.
 
 Uncompressed, the writer appends a record to its type's open part when its segment opens (once 2 or 3 samples
 confirm the formula), so every record written while reel k is open belongs to reel k's range. Compressed, it holds the
-reel's records, at most the cap, and writes each type's range as one frame when the reel closes. Segmenting decides a
+reel's records, at most its cap, and writes each type's range as one frame when the reel closes. Segmenting decides a
 few steps after the fact (up to the raw-fallback window, about 15 steps), so a reel closes only once the segmenter has
 decided every step up to the reel's end.
 
@@ -365,7 +365,7 @@ the largest reel seen so far.
 - at the boundary the two swap, and the old current becomes the next one to fill;
 - a jump fills the spare with the target reel, then swaps.
 
-A reel whose single step exceeds the cap is the one case where a buffer grows. A reader grows it once rather than
+A reel whose single step exceeds its cap is the one case where a buffer grows. A reader grows it once rather than
 fail. Packed records stay packed in the buffers and are decoded when a key copies them into a body's state.
 
 ## Playback
