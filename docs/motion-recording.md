@@ -13,10 +13,11 @@ the segment formulas rely on, is pinned by [joltIntegration.test.ts](../src/sim/
   rolls, a box on a turntable turns in place.
 - A segment is a **key** (when it starts, its type, which record) and a **record** (the formula's coefficients at
   that moment). Its end is the next key in its channel. Nothing is stored twice.
-- Records of one type all have the same size and live in one **type file**, so record `i` is at
-  `header + i × size` and a reader loads a type's records into one array.
-- **Chunks** divide the run in time. A chunk holds the keys for its time span, each body's keys in a slice of their
-  own, and for each type file the one contiguous range of records those keys use.
+- Records of one type all have the same size and live in that type's **type file**, split into numbered parts, so
+  record `i` of a part is at `header + i × size` and a reader loads a type's records into one array.
+- **Reels** divide the run in time. A reel holds the keys for its time span, each body's keys in a slice of their
+  own, and for each type the one contiguous range of records those keys use. A reel is a unit of this file format
+  only. It is unrelated to the chunks Unity's Entities package stores entities in.
 
 ## Files
 
@@ -24,11 +25,11 @@ A recording is a folder, `<name>.oipmotion/`:
 
 | File | Holds |
 |---|---|
-| `manifest.json` | format version, step rate, step count, units and axes, the type table (name, file, record size), chunk limits |
+| `manifest.json` | format version, step rate, step count, units and axes, the type table (name, file stem, record size), reel and part limits |
 | `bodies.bin` | one row per body in the recording |
-| `chunks.bin` | the chunk table, one row per chunk, appended as each chunk closes |
-| `index.bin` | the chunks: each one's body table and keys |
-| `seg-*.bin`, `rot-*.bin` | one file per segment type |
+| `reels.bin` | the reel table, one row per reel, appended as each reel closes |
+| `index.bin` | the reels: each one's body table and keys |
+| `seg-<type>.<part>.bin`, `rot-<type>.<part>.bin` | one series of parts per segment type, e.g. `seg-linear.000.bin` |
 | `samples.bin` | step samples that raw segments and events refer to |
 | `events.bin` | the transitions between segments, for analysis |
 
@@ -49,22 +50,22 @@ Every record's time origin is its key's time: `τ = t - t_key`. Fields are float
 
 Translation:
 
-| Type | File | Record | Bytes | Position at τ |
+| Type | File stem | Record | Bytes | Position at τ |
 |---|---|---|---|---|
-| rest | `seg-rest.bin` | p | 12 | `p` |
-| linear | `seg-linear.bin` | p, v | 24 | `p + v τ` |
-| quadratic | `seg-quadratic.bin` | p, v, a | 36 | `p + v τ + a τ² / 2` |
-| damped | `seg-damped.bin` | p, v, a, λ | 40 | `p + v∞ τ + (v - v∞)(1 - e^(-λτ)) / λ`, with `v∞ = a / λ` |
-| raw | `seg-raw.bin` | u32 first sample, u32 count | 8 | interpolated from `samples.bin` |
+| rest | `seg-rest` | p | 12 | `p` |
+| linear | `seg-linear` | p, v | 24 | `p + v τ` |
+| quadratic | `seg-quadratic` | p, v, a | 36 | `p + v τ + a τ² / 2` |
+| damped | `seg-damped` | p, v, a, λ | 40 | `p + v∞ τ + (v - v∞)(1 - e^(-λτ)) / λ`, with `v∞ = a / λ` |
+| raw | `seg-raw` | u32 first sample, u32 count | 8 | interpolated from `samples.bin` |
 
 Rotation:
 
-| Type | File | Record | Bytes | Rotation at τ |
+| Type | File stem | Record | Bytes | Rotation at τ |
 |---|---|---|---|---|
-| rest | `rot-rest.bin` | q | 16 | `q` |
-| spin | `rot-spin.bin` | q, ω | 28 | `rotate(ω / |ω|, |ω| τ) · q` |
-| damped spin | `rot-damped.bin` | q, ω, λ | 32 | the same with angle `|ω| (1 - e^(-λτ)) / λ` |
-| raw | `rot-raw.bin` | u32 first sample, u32 count | 8 | slerp between samples |
+| rest | `rot-rest` | q | 16 | `q` |
+| spin | `rot-spin` | q, ω | 28 | `rotate(ω / |ω|, |ω| τ) · q` |
+| damped spin | `rot-damped` | q, ω, λ | 32 | the same with angle `|ω| (1 - e^(-λτ)) / λ` |
+| raw | `rot-raw` | u32 first sample, u32 count | 8 | slerp between samples |
 
 The spin axis is fixed in world space: Jolt applies no gyroscopic torque, so a free body keeps its angular
 velocity's direction. Damping is fitted by the writer as a continuous rate λ: Jolt scales a velocity by
@@ -85,10 +86,10 @@ f32  fraction   where in that step, 0 to 1
 u8   type       index into the manifest's type table
 u8   flags      1 carry-in, 2 jump, 4 end, 8 slop-corrected
 u16  reserved
-u32  record     index into this chunk's range of that type's file
+u32  record     index into this reel's range of that type's records
 ```
 
-- **carry-in**: the first key of a body alive at the chunk's start, at the chunk's start time.
+- **carry-in**: the first key of a body alive at the reel's start, at the reel's start time.
 - **jump**: the position does not continue from the previous segment (a teleport, a hold taking the body). A player
   snaps here and never blends across it.
 - **end**: the body leaves the world at this time. It has no record.
@@ -107,17 +108,19 @@ per body: u32 id, f32 mass, f32 linearDamping, f32 angularDamping, f32 halfX, ha
 
 A string is a u16 byte count and UTF-8 bytes. Ids are OIP frame ids: stable for a body's life and never reused.
 
-## Chunks
+## Reels
 
-`chunks.bin` has a header (u32 version, u32 type count) and one row per chunk:
+`reels.bin` has a header (u32 version, u32 type count) and one row per reel:
 
 ```
 u32 firstStep, u32 lastStep
-u64 offset, u32 length            the chunk in index.bin
-per type, in manifest order: u32 firstRecord, u32 recordCount
+u64 offset, u32 length            the reel in index.bin
+per type, in manifest order: u16 part, u32 firstRecord, u32 recordCount
 ```
 
-A chunk in `index.bin`:
+`firstRecord` counts within the part, so a part's offsets fit 32 bits.
+
+A reel in `index.bin`:
 
 ```
 u32 bodyCount, u32 keyCount
@@ -125,40 +128,62 @@ bodies[bodyCount]:
   u32 bodyId
   u32 transFirst, u16 transCount
   u32 rotFirst,   u16 rotCount
-  u8  flags       1 alive at start, 2 spawns in this chunk, 4 ends in this chunk
+  u8  flags       1 alive at start, 2 spawns in this reel, 4 ends in this reel
 keys[keyCount]    grouped by body and channel, each group in time order
 ```
 
-What a chunk guarantees:
+What a reel guarantees:
 
-1. **Every body present has its own key slice per channel**, and for any time in the chunk the slice says exactly one
+1. **Every body present has its own key slice per channel**, and for any time in the reel the slice says exactly one
    of: not spawned yet (before its first key), in segment i, or gone (at or after an end key).
-2. **A body alive at the chunk's start has a carry-in key at that time**, so its state is known without reading any
-   earlier chunk. A body at rest for the whole chunk has one key per channel.
-3. **Each type's records form one contiguous range.** A carry-in points at a copy of its segment's record
-   re-anchored to the chunk's start (coefficients evaluated there), written at the front of the range. Loading a
-   chunk is one read of its index bytes and one read per type file.
-4. **A body not listed is not in the world** for the whole chunk.
+2. **A body alive at the reel's start has a carry-in key at that time**, so its state is known without reading any
+   earlier reel. A body at rest for the whole reel has one key per channel.
+3. **Each type's records form one contiguous range in one part.** A carry-in points at a copy of its segment's record
+   re-anchored to the reel's start (coefficients evaluated there), written at the front of the range. Loading a reel
+   is one read of its index bytes and one read per type.
+4. **A body not listed is not in the world** for the whole reel.
+5. **A reel is never larger than the cap**, counting its index bytes and the records in its ranges, except a reel of
+   a single step whose keys alone exceed it.
 
-### When a chunk closes
+### When a reel closes
 
-A chunk closes at the end of the first step where its size reaches the target, counting its index bytes and the
-records in its ranges, but not before it spans the minimum time and not after it spans the maximum. A step's keys
-never split across chunks. The manifest records the limits; the defaults are a 512 KB target, 1 s minimum and 5 min
-maximum. The maximum bounds what a crash loses and how long a live reader waits in a quiet period. The size target
-must stay well above the carry-in cost: 1,000 live bodies cost about 50 KB of table rows and carry-in keys per chunk
-before their records.
+A reel closes at the end of the first step that brings it to the size cap, or that brings its span to the maximum
+time, whichever comes first. It does not close earlier than the minimum time span unless the cap forces it: the cap
+wins, so a player can size its buffers from the cap. A step's keys never split across reels. The manifest records the
+limits; the defaults are a 512 KB cap, 1 s minimum and 5 min maximum. The maximum bounds what a crash loses and how
+long a live reader waits in a quiet period. The cap must stay well above the carry-in cost: 1,000 live bodies cost
+about 50 KB of table rows and carry-in keys per reel before their records.
 
-The writer appends a record to its type file when its segment opens (once 2 or 3 samples confirm the formula), so
-every record written while chunk k is open belongs to chunk k's range. Segmenting decides a few steps after the
-fact (up to the raw-fallback window, about 15 steps), so a chunk closes only once the segmenter has decided every
-step up to the chunk's end.
+The writer appends a record to its type's open part when its segment opens (once 2 or 3 samples confirm the formula),
+so every record written while reel k is open belongs to reel k's range. Segmenting decides a few steps after the
+fact (up to the raw-fallback window, about 15 steps), so a reel closes only once the segmenter has decided every
+step up to the reel's end.
+
+### Parts
+
+A type's part closes, and the next number opens, once it reaches the part limit (default 256 MB), but only at a reel
+boundary, so no reel's range spans two parts. Types roll over independently. A closed part never changes, so it can
+be copied, checksummed or uploaded while the recording continues, and a recording that keeps a rolling window
+deletes its oldest parts; `reels.bin` shows which reels that leaves unplayable.
 
 ## Events
 
 `events.bin` holds what analysis needs about each transition and playback does not: per event the body, channel,
 time (step and fraction), Δv, impulse, the axis the time was found on, the other body or part, the slop-corrected
 flag, and a sample range in `samples.bin` around it.
+
+## Reading
+
+A player keeps two buffers per type, current and next, each sized from the cap (`cap / record size` records), plus
+two for the index bytes. They are allocated once and reused for the whole playback, so memory stays flat however long
+the recording is:
+
+- while reel k plays, current holds its ranges and next is filled with reel k + 1's in the background;
+- at the boundary the two swap, and the old current becomes the next one to fill;
+- a jump fills the spare with the target reel, then swaps.
+
+A reel whose single step exceeds the cap is the one case where a buffer grows. A reader grows it once rather than
+fail.
 
 ## Playback
 
@@ -178,17 +203,17 @@ if key c is an end key:                                  hidden
 otherwise: visible, evaluate key c's record at t - key c's time
 ```
 
-At a chunk switch, for sequential play or a jump:
+At a reel change, for sequential play or a jump:
 
-1. load the chunk containing t (binary search `chunks.bin` by first step), or swap in the preloaded next one;
-2. **clear** every body's slice to empty, so a body the new chunk does not list hides instead of keeping its pose;
-3. **apply** the chunk's body table: each listed body's slices, cursor 0;
+1. swap in the preloaded next reel, or load the reel containing t (binary search `reels.bin` by first step);
+2. **clear** every body's slice to empty, so a body the new reel does not list hides instead of keeping its pose;
+3. **apply** the reel's body table: each listed body's slices, cursor 0;
 4. run the per-frame check, which places every body.
 
-A player shows the last complete frame while a jump's chunk loads, never a frame with some bodies updated.
+A player shows the last complete frame while a jump's reel loads, never a frame with some bodies updated.
 
 In an ECS engine this is one job over all body entities for the key check (slice, cursor, current record and type
-as components, the chunk's keys as one shared array), then one job per segment type over the entities whose current
+as components, the reel's keys as one shared array), then one job per segment type over the entities whose current
 segment is that type, each reading only its own type's records. The type jobs write different entities and run
 together. Translation and rotation write separate components that a final job combines.
 
@@ -198,6 +223,6 @@ together. Translation and rotation write separate components that a final job co
   segmenter's tolerances. This is the writer's test, run against motion-export output.
 - **Invariants a player can assert**: every body was checked this frame, and its key c satisfies
   `time(c) <= t < time(c + 1)`.
-- **Chunk invariants a reader can assert**: each slice is in time order, a body alive at the start begins with a
-  carry-in at the chunk's start time, every key's record lies inside its type's range, and keys after an end key do
-  not exist.
+- **Reel invariants a reader can assert**: each slice is in time order, a body alive at the start begins with a
+  carry-in at the reel's start time, every key's record lies inside its type's range, keys after an end key do not
+  exist, and the reel is within the cap.
