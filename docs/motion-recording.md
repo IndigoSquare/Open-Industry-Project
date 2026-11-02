@@ -30,8 +30,8 @@ A recording is a folder, `<name>.oipmotion/`:
 | `reels.bin` | the reel table, one row per reel, appended as each reel closes |
 | `index.bin` | the reels: each one's body table and keys |
 | `seg-<type>.<part>.bin`, `rot-<type>.<part>.bin` | one series of parts per segment type, e.g. `seg-linear.000.bin` |
-| `samples.bin` | step samples that raw segments and events refer to |
 | `events.bin` | the transitions between segments, for analysis |
+| `event-samples.bin` | the step samples around each event, with velocities, for analysis |
 
 All binary fields are little-endian. Units are metres, seconds and radians; axes are right-handed with Y up, as in
 OIP and Jolt. A reader for a left-handed engine (Unity) mirrors z: position `(x, y, -z)`, rotation
@@ -56,7 +56,7 @@ Translation:
 | linear | `seg-linear` | p, v | 24 | `p + v τ` |
 | quadratic | `seg-quadratic` | p, v, a | 36 | `p + v τ + a τ² / 2` |
 | damped | `seg-damped` | p, v, a, λ | 40 | `p + v∞ τ + (v - v∞)(1 - e^(-λτ)) / λ`, with `v∞ = a / λ` |
-| raw | `seg-raw` | u32 first sample, u32 count | 8 | interpolated from `samples.bin` |
+| raw | `seg-raw` | p, one record per step | 12 | linear between the two step records either side of t |
 
 Rotation:
 
@@ -65,7 +65,7 @@ Rotation:
 | rest | `rot-rest` | q | 16 | `q` |
 | spin | `rot-spin` | q, ω | 28 | `rotate(ω / |ω|, |ω| τ) · q` |
 | damped spin | `rot-damped` | q, ω, λ | 32 | the same with angle `|ω| (1 - e^(-λτ)) / λ` |
-| raw | `rot-raw` | u32 first sample, u32 count | 8 | slerp between samples |
+| raw | `rot-raw` | q, one record per step | 16 | normalised linear between the two step records either side of t |
 
 The spin axis is fixed in world space: Jolt applies no gyroscopic torque, so a free body keeps its angular
 velocity's direction. Damping is fitted by the writer as a continuous rate λ: Jolt scales a velocity by
@@ -73,8 +73,27 @@ velocity's direction. Damping is fitted by the writer as a continuous rate λ: J
 motion (a solid cylinder decays at `c / 3`). The round-trip check below bounds how far the continuous form strays
 from the steps.
 
-A raw segment covers motion no formula fits (tumbling, contact chatter). Its samples are consecutive steps from the
-key's step, in the export's sample layout (position, rotation, linear velocity, angular velocity).
+### Raw segments
+
+A raw segment covers motion no formula fits (tumbling, contact chatter, a stack settling). It stores the body's pose
+at every simulation step and nothing is fitted, so playback reproduces the simulation exactly at every step.
+
+- Its records are one per step, consecutive in its type's range: positions in `seg-raw`, rotations in `rot-raw`. A
+  channel stores only its own values, so a body whose rotation is raw and whose translation is linear stores no
+  positions.
+- It starts and ends on whole steps: its key's fraction is 0, and the writer moves the start of the segment after it
+  to a whole step too. Its records run from its key's step to the next key's step inclusive, so the last record is
+  the next segment's starting pose and the count is `nextKey.step - key.step + 1`. A raw segment before an end key
+  stops at the end key's step.
+- Between steps it is linear only. With `u = (t - t_key) × hz`, `n = floor(u)` and `a = u - n`:
+  - position: `p[n] + (p[n+1] - p[n]) × a`
+  - rotation: `normalise(q[n] × (1 - a) + s × q[n+1] × a)`, where `s` is -1 when `q[n] · q[n+1] < 0` and 1
+    otherwise, so it turns the short way. Between steps a body turns a few degrees at most, so this stays within a
+    hair of slerp.
+- It carries no velocities. Where one is wanted, `(p[n+1] - p[n]) × hz` is Jolt's velocity for step n + 1, apart
+  from position corrections (joltIntegration.test.ts). Velocities for analysis are in `event-samples.bin`.
+
+At 100 Hz a raw translation costs 1.2 KB a second and a raw rotation 1.6 KB.
 
 ## Keys
 
@@ -139,8 +158,11 @@ What a reel guarantees:
 2. **A body alive at the reel's start has a carry-in key at that time**, so its state is known without reading any
    earlier reel. A body at rest for the whole reel has one key per channel.
 3. **Each type's records form one contiguous range in one part.** A carry-in points at a copy of its segment's record
-   re-anchored to the reel's start (coefficients evaluated there), written at the front of the range. Loading a reel
-   is one read of its index bytes and one read per type.
+   re-anchored to the reel's start (coefficients evaluated there), written at the front of the range. For a raw
+   segment the carry-in's records are its steps from the reel's start, the first being the step record the previous
+   reel ends with. A raw segment that runs past a reel's end has its records to the first step at or after that end in
+   the reel, so its last interval can be drawn without the next reel. Loading a reel is one read of its index bytes and
+   one read per type.
 4. **A body not listed is not in the world** for the whole reel.
 5. **A reel is never larger than the cap**, counting its index bytes and the records in its ranges, except a reel of
    a single step whose keys alone exceed it.
@@ -170,7 +192,8 @@ deletes its oldest parts; `reels.bin` shows which reels that leaves unplayable.
 
 `events.bin` holds what analysis needs about each transition and playback does not: per event the body, channel,
 time (step and fraction), Δv, impulse, the axis the time was found on, the other body or part, the slop-corrected
-flag, and a sample range in `samples.bin` around it.
+flag, and a range in `event-samples.bin`: the steps around it with position, rotation, linear velocity and angular
+velocity, in the export's sample layout.
 
 ## Reading
 
@@ -220,7 +243,8 @@ together. Translation and rotation write separate components that a final job co
 ## Checks
 
 - **Round trip**: evaluating the segments at every step of the run reproduces the export's samples within the
-  segmenter's tolerances. This is the writer's test, run against motion-export output.
+  segmenter's tolerances, and a raw segment reproduces them exactly. This is the writer's test, run against
+  motion-export output.
 - **Invariants a player can assert**: every body was checked this frame, and its key c satisfies
   `time(c) <= t < time(c + 1)`.
 - **Reel invariants a reader can assert**: each slice is in time order, a body alive at the start begins with a
