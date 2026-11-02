@@ -254,8 +254,8 @@ A reel in `index.bin`:
 
 ```
 u32 bodyCount, u32 keyCount
-bodies[bodyCount], 148 bytes each:
-  u32 bodyId
+bodies[bodyCount], 148 bytes each, in ascending bodyId order:
+  u32 bodyId          the OIP frame id, as in bodies.bin; each at most once per reel
   u32 startTick       0 if alive at the reel's start, else the tick it spawns at
   u32 endTick         the tick it leaves at, 0xffffffff if it is still there at the reel's end
   u8  flags, u8×3 0   flags: 1 jump at start (it did not continue from the previous reel's pose)
@@ -263,6 +263,9 @@ bodies[bodyCount], 148 bytes each:
   carry state, 100 bytes
 keys[keyCount]       grouped by body and channel, each slice in time order
 ```
+
+The rows are sorted by body id, so a reader finds one body's row by binary search, and the reel apply pass reads the
+bodies in the same order each reel, in step with an entity array that is in id order too.
 
 ### Carry state
 
@@ -457,8 +460,9 @@ every channel.
   that time, within the packing's precision, unless its row has the jump flag.
 - **Invariants a player can assert**: every visible body was checked this frame, and every channel satisfies
   `start <= T < next`.
-- **Reel invariants a reader can assert**: each slice is in time order and lies within the body's start and end, every
-  key's record lies inside its type's range, and the reel is within its cap.
+- **Reel invariants a reader can assert**: the rows are in strictly ascending body id order, each slice is in time
+  order and lies within the body's start and end, every key's record lies inside its type's range, and the reel is
+  within its cap.
 - **Tuning the reel limits**: the minimum cap and row factor are measured, not assumed. Record representative runs (a
   small cell, the demo cell with about 1,000 bodies, a large stress scene) and measure:
   1. the time to load and decode the largest reel on the target machine, which must stay well under one frame
