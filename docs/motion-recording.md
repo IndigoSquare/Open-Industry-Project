@@ -63,9 +63,11 @@ number of ticks at every step rate (a 60 Hz step is not a whole number of micros
 
 ## Packed values
 
-Three values are stored packed, each in a `u64` read as one integer. The formula records are not packed: their
-velocities, accelerations and damping rates are multiplied by τ, so a rounding error in them grows over a long segment
-(a half-float velocity drifts about 1 cm in 10 s at 2 m/s), and they are few next to raw records and keys.
+Three kinds of value are stored packed, each in a `u64` read as one integer: raw positions, every quaternion (raw
+steps and the `q₀` of rotation records) and keys. A formula record's rates stay float32: velocities, accelerations
+and damping rates are multiplied by τ, so a rounding error in them grows over a long segment (a half-float velocity
+drifts about 1 cm in 10 s at 2 m/s), and they are few next to raw records and keys. A starting orientation is not
+multiplied by τ, so packing it costs nothing as the segment runs.
 
 ### Raw positions: fixed point, 21 bits per axis
 
@@ -98,14 +100,17 @@ bits  0-1   which component of (x, y, z, w) was dropped
 bits  2-21  the first remaining component, in (x, y, z, w) order
 bits 22-41  the second
 bits 42-61  the third
-bits 62-63  0
+bit   62    sign: 1 negates the whole decoded quaternion
+bit   63    0
 ```
 
 A unit quaternion's components satisfy `x² + y² + z² + w² = 1`, so one can be rebuilt from the other three. The writer
-drops the largest in magnitude, negating the whole quaternion first if that one is negative (q and -q are the same
-rotation), so the dropped component is never negative. The other three then lie within ±1/√2, stored as
-`round((c + 1/√2) / √2 × (2²⁰ - 1))`. The reader maps them back and rebuilds the dropped one as
-`sqrt(max(0, 1 - a² - b² - c²))`. The rotation is off by at most about 0.0002°.
+drops the largest in magnitude, negating the whole quaternion first if that one is negative, so the dropped component
+is never negative, and sets the sign bit when it negated. The other three then lie within ±1/√2, stored as
+`round((c + 1/√2) / √2 × (2²⁰ - 1))`. The reader maps them back, rebuilds the dropped one as
+`sqrt(max(0, 1 - a² - b² - c²))`, and negates all four when the sign bit is set, so it gets back the sign the writer
+chose (see Sign continuity). The rotation is off by at most about 0.0002°. Every stored quaternion is packed this way:
+raw steps and the `q₀` of every rotation record.
 
 ### Keys: tick and packed fields, 8 bytes
 
@@ -121,7 +126,8 @@ The key is two `u32`, so a reader in any language takes it without 64-bit arithm
 
 ## Segment types
 
-Every record's time origin is its key's time: `τ = t - t_key`. Formula fields are float32.
+Every record's time origin is its key's time: `τ = t - t_key`. Rates and positions in formula records are float32;
+quaternions are packed. There are 13 types, 5 translation and 8 rotation, within the key's 16.
 
 Translation:
 
@@ -133,20 +139,68 @@ Translation:
 | damped | `seg-damped` | p, v, a, λ | 40 | `p + v∞ τ + (v - v∞)(1 - e^(-λτ)) / λ`, with `v∞ = a / λ` |
 | raw | `seg-raw` | packed position, one per step | 8 | linear between the two step records either side of t |
 
-Rotation:
+Damping is fitted by the writer as a continuous rate λ: Jolt scales a velocity by `k = 1 - c dt` per step after adding
+the step's forces, and a rolling body shares its angular damping with its linear motion (a solid cylinder decays at
+`c / 3`). The round-trip check below bounds how far the continuous form strays from the steps.
+
+### Rotation
+
+A rotation segment is the orientation at its start, `q₀`, turned on by the angular velocity, which is world-frame as
+Jolt reports it. Turning by a rotation vector `r` (axis × angle) is `exp(r) = (r/|r| · sin(|r|/2), cos(|r|/2))`, with
+`exp(0)` no rotation; near zero a reader uses the series `(r/2 · (1 - |r|²/48), 1 - |r|²/8)`. `exp` takes any angle,
+so a body that turns many times in one segment needs no extra keys.
+
+**Rotation-vector types**, the general family:
 
 | Type | File stem | Record | Bytes | Rotation at τ |
 |---|---|---|---|---|
-| rest | `rot-rest` | q | 16 | `q` |
-| spin | `rot-spin` | q, ω | 28 | `rotate(ω / |ω|, |ω| τ) · q` |
-| damped spin | `rot-damped` | q, ω, λ | 32 | the same with angle `|ω| (1 - e^(-λτ)) / λ` |
+| rest | `rot-rest` | q₀ | 8 | `q₀` |
+| spin | `rot-spin` | q₀, ω | 20 | `exp(ω τ) · q₀` |
+| accel | `rot-accel` | q₀, ω, α | 32 | `exp(ω τ + α τ² / 2) · q₀` |
+| damped | `rot-damped` | q₀, ω, α, λ | 36 | `exp(ω∞ τ + (ω - ω∞)(1 - e^(-λτ)) / λ) · q₀`, with `ω∞ = α / λ` |
 | raw | `rot-raw` | packed rotation, one per step | 8 | normalised linear between the two step records either side of t |
 
-The spin axis is fixed in world space: Jolt applies no gyroscopic torque, so a free body keeps its angular
-velocity's direction. Damping is fitted by the writer as a continuous rate λ: Jolt scales a velocity by
-`k = 1 - c dt` per step after adding the step's forces, and a rolling body shares its angular damping with its linear
-motion (a solid cylinder decays at `c / 3`). The round-trip check below bounds how far the continuous form strays
-from the steps.
+`q₀` is a packed rotation; ω, α (3-vectors) and λ are float32. Each is exact while the axis stays fixed: Jolt applies
+no gyroscopic torque, so a free body keeps its angular velocity's direction, and a spin, a spin-up or a body rolling
+to a stop keeps its axis. When the axis turns (a box toppling while it turns, a body precessing in contact) the
+rotation vector's curvature follows the drift, and the writer keeps the segment only while the round trip holds;
+then it starts a new one or falls back to raw. The rates are per world axis, so within a segment the angular velocity
+is `ṙ(τ)`: exact for a fixed axis, close otherwise. Jolt's own per-step angular velocity is in `event-samples.bin`.
+
+**Single-axis types**, for a body turning about one axis: an upright box on a turntable or spur (world Y), a drum
+rolling about its own length (body X, at any heading). They store scalar rates, are exact for every profile, and the
+writer uses them whenever the axis stays within tolerance of one axis:
+
+| Type | File stem | Record | Bytes | Rotation at τ |
+|---|---|---|---|---|
+| axis spin | `rot-axis-spin` | axis, q₀, ω | 16 | `θ(τ) = ω τ` |
+| axis accel | `rot-axis-accel` | axis, q₀, ω, α | 20 | `θ(τ) = ω τ + α τ² / 2` |
+| axis damped | `rot-axis-damped` | axis, q₀, ω, α, λ | 24 | `θ(τ) = ω∞ τ + (ω - ω∞)(1 - e^(-λτ)) / λ`, with `ω∞ = α / λ` |
+
+```
+u8   axis      bits 0-1: 0 X, 1 Y, 2 Z
+               bit  2:   0 a world axis: q = exp(e θ) · q₀
+                         1 the body's own axis: q = q₀ · exp(e θ)
+               bits 3-7: 0
+u8×3 0
+u64  q₀        packed rotation at the segment's start
+f32  ω, α, λ   as the type has them: scalar rates about the axis, rad/s, rad/s², 1/s
+```
+
+`e` is the unit vector of the axis. θ is the angle turned since the segment's start, so `θ(τ)` read on its own is the
+heading change of an upright box or how far a drum has rolled. A rest needs no single-axis type: `rot-rest` holds any
+orientation in 8 bytes.
+
+### Sign continuity
+
+A quaternion `q` and `-q` are the same rotation. Interpolating between two that differ in sign goes the long way
+round, a near full turn between two near equal orientations, and a curve through stored values jumps. So the writer
+chooses every stored quaternion's sign to continue from the one before it in the same channel: it stores `-q` when
+`q · previous < 0`. That holds for each raw step against the step before it, for each segment's `q₀` against where the
+previous segment ends (a spin past one turn ends at `-q₀`, and the next segment continues from that), and for each
+carry-in against where the previous reel's segment stands at the reel's start. The packed sign bit carries the chosen
+sign through packing. A reader can then interpolate between any two neighbouring stored values directly. The sign
+check in raw interpolation stays as a guard and never fires on a file written to this rule.
 
 ### Raw segments
 
@@ -165,8 +219,8 @@ precision.
   values:
   - position: `p[n] + (p[n+1] - p[n]) × a`
   - rotation: `normalise(q[n] × (1 - a) + s × q[n+1] × a)`, where `s` is -1 when `q[n] · q[n+1] < 0` and 1
-    otherwise, so it turns the short way. Between steps a body turns a few degrees at most, so this stays within a
-    hair of slerp.
+    otherwise, so it turns the short way. With sign continuity `s` is always 1; the check is a guard. Between steps a
+    body turns a few degrees at most, so this stays within a hair of slerp.
 - It carries no velocities. Where one is wanted, `(p[n+1] - p[n]) × hz` is Jolt's velocity for step n + 1, apart
   from position corrections (joltIntegration.test.ts) and the quantum. Velocities for analysis are in
   `event-samples.bin`.
@@ -325,7 +379,9 @@ together. Translation and rotation write separate components that a final job co
   segmenter's tolerances. A raw segment reproduces them within half a quantum per axis and the rotation packing's
   0.0002°. This is the writer's test, run against motion-export output.
 - **Packing**: encoding then decoding a position lands within half a quantum on each axis, a rotation within the
-  packing's error, and a quaternion with a negative largest component decodes to the same rotation.
+  packing's error, and a quaternion of either sign decodes to the same quaternion, sign included.
+- **Sign continuity**: every stored quaternion has a non-negative dot product with the one before it in its channel,
+  across steps, segments and reels.
 - **Invariants a player can assert**: every body was checked this frame, and its key c satisfies
   `tick(c) <= T < tick(c + 1)`.
 - **Reel invariants a reader can assert**: each slice is in time order, a body alive at the start begins with a
