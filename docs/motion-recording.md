@@ -243,6 +243,7 @@ A string is a u16 byte count and UTF-8 bytes. Ids are OIP frame ids: stable for 
 ```
 u32 firstStep, u32 lastStep
 u64 offset, u32 length            the reel in index.bin
+u32 cap                           the reel's size cap in bytes
 per type, in manifest order: u16 part, u32 byteOffset, u32 byteLength, u32 recordCount
 ```
 
@@ -305,11 +306,23 @@ rest or riding a belt steadily costs its 148-byte row and nothing else.
 
 ### When a reel closes
 
-A reel closes at the end of the first step that brings it to the size cap, or that brings its span to the maximum
+A reel closes at the end of the first step that brings it to its size cap, or that brings its span to the maximum
 time, whichever comes first. It does not close earlier than the minimum time span unless the cap forces it. A step's
-keys never split across reels. The manifest records the limits; the defaults are a 2 MB cap, 1 s minimum and 8.5 min
-maximum. The maximum bounds what a crash loses and how long a live reader waits in a quiet period. The cap must stay
-well above the rows: 1,000 bodies present cost 148 KB of rows per reel before any keys or records.
+keys never split across reels.
+
+Each reel's cap is set when it opens, from the bodies present then:
+
+```
+cap = max(minimumCap, bodiesPresent × 148 × rowFactor)
+```
+
+Every body present repeats its 148-byte row in every reel, so a fixed cap would leave a large scene's reels mostly
+rows (3,000 bodies fill 87% of a 512 KB reel before any keys). Scaling the cap with the body count keeps the rows to
+at most `1 / rowFactor` of a reel at any scene size, while a small cell keeps small reels. The defaults are a 512 KB
+minimum cap, a row factor of 8, a 1 s minimum span and an 8.5 min maximum, recorded in the manifest; they are starting
+values to tune with the measurements under Checks. With them, 100 bodies give 512 KB reels, 1,000 give 1.2 MB and
+10,000 give 12 MB. The maximum span bounds what a crash loses and how long a live reader waits in a quiet period,
+whatever the cap. The reel table records each reel's cap.
 
 Uncompressed, the writer appends a record to its type's open part when its segment opens (once 2 or 3 samples
 confirm the formula), so every record written while reel k is open belongs to reel k's range. Compressed, it holds the
@@ -344,8 +357,9 @@ layout. These stay unpacked because residuals and impulses are measured at the 1
 
 A player keeps two buffers per type, current and next, plus two for the index bytes, allocated once and reused for
 the whole playback, so memory stays flat however long the recording is. A finished recording's manifest gives each
-type's largest range in any reel, which sizes its buffers; while a recording is still being written a reader sizes
-them from the cap.
+type's largest range in any reel, which sizes its buffers. While a recording is still being written, a reader sizes
+them from each reel's row in the reel table as it arrives, growing a buffer when a reel needs more, so memory follows
+the largest reel seen so far.
 
 - while reel k plays, current holds its ranges and next is filled with reel k + 1's in the background;
 - at the boundary the two swap, and the old current becomes the next one to fill;
@@ -444,4 +458,10 @@ every channel.
 - **Invariants a player can assert**: every visible body was checked this frame, and every channel satisfies
   `start <= T < next`.
 - **Reel invariants a reader can assert**: each slice is in time order and lies within the body's start and end, every
-  key's record lies inside its type's range, and the reel is within the cap.
+  key's record lies inside its type's range, and the reel is within its cap.
+- **Tuning the reel limits**: the minimum cap and row factor are measured, not assumed. Record representative runs (a
+  small cell, the demo cell with about 1,000 bodies, a large stress scene) and measure:
+  1. the time to load and decode the largest reel on the target machine, which must stay well under one frame
+     (about 16 ms), since a jump waits for it;
+  2. the share of each reel spent on body rows, against `1 / rowFactor`;
+  3. the recording's total size at a few row factors, to see where a larger factor stops shrinking it.
