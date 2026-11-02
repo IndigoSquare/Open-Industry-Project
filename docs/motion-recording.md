@@ -39,10 +39,25 @@ OIP and Jolt. A reader for a left-handed engine (Unity) mirrors z: position `(x,
 
 ## Time
 
-A time is a step and a fraction of a step: `t = (step + fraction) / hz`. A segment that starts on a step has
-fraction 0. A segment that starts at an event inside a step (an impact) carries the fraction the writer found for
-it. An integer step keeps time exact over any run length, where a float32 time loses millisecond resolution within
-hours.
+A time is a whole number of **ticks**, 8192 to a step: fixed point, with the step in the high bits and the fraction of
+a step in the low 13.
+
+```
+tick     = step × 8192 + round(fraction × 8192)
+step     = tick >> 13
+fraction = (tick & 8191) / 8192
+seconds  = tick / (8192 × hz)
+```
+
+A tick is 1.2 µs at 100 Hz and 0.12 µs at 1000 Hz. A segment that starts on a step has a tick that is a multiple of
+8192; one that starts at an event inside a step (an impact) carries the fraction the writer found for it. Integers
+keep every time exact over any run length, where a float32 time loses millisecond resolution within hours, and two
+times compare in one integer comparison.
+
+- **Within a reel** a time is a `u32` tick count from the reel's first step. 2³² ticks is 524,288 steps, which is
+  8.7 minutes at 1000 Hz, the fastest step rate, so it covers the longest reel at every rate.
+- **Across the recording** (events) a time is a `u64` tick count from step 0.
+- Reel and part boundaries, spawn and end steps are whole steps and stay `u32` step numbers.
 
 ## Segment types
 
@@ -81,10 +96,10 @@ at every simulation step and nothing is fitted, so playback reproduces the simul
 - Its records are one per step, consecutive in its type's range: positions in `seg-raw`, rotations in `rot-raw`. A
   channel stores only its own values, so a body whose rotation is raw and whose translation is linear stores no
   positions.
-- It starts and ends on whole steps: its key's fraction is 0, and the writer moves the start of the segment after it
-  to a whole step too. Its records run from its key's step to the next key's step inclusive, so the last record is
-  the next segment's starting pose and the count is `nextKey.step - key.step + 1`. A raw segment before an end key
-  stops at the end key's step.
+- It starts and ends on whole steps: its key's tick is a multiple of 8192, and the writer moves the start of the
+  segment after it to a whole step too. Its records run from its key's step to the next key's step inclusive, so the
+  last record is the next segment's starting pose and the count is `(nextKey.tick - key.tick) / 8192 + 1`. A raw
+  segment before an end key stops at the end key's step.
 - Between steps it is linear only. With `u = (t - t_key) × hz`, `n = floor(u)` and `a = u - n`:
   - position: `p[n] + (p[n+1] - p[n]) × a`
   - rotation: `normalise(q[n] × (1 - a) + s × q[n+1] × a)`, where `s` is -1 when `q[n] · q[n+1] < 0` and 1
@@ -97,18 +112,17 @@ At 100 Hz a raw translation costs 1.2 KB a second and a raw rotation 1.6 KB.
 
 ## Keys
 
-16 bytes:
+12 bytes:
 
 ```
-u32  step       the step the segment starts in
-f32  fraction   where in that step, 0 to 1
+u32  tick       when the segment starts, in ticks from the reel's first step
 u8   type       index into the manifest's type table
 u8   flags      1 carry-in, 2 jump, 4 end, 8 slop-corrected
 u16  reserved
 u32  record     index into this reel's range of that type's records
 ```
 
-- **carry-in**: the first key of a body alive at the reel's start, at the reel's start time.
+- **carry-in**: the first key of a body alive at the reel's start, at tick 0.
 - **jump**: the position does not continue from the previous segment (a teleport, a hold taking the body). A player
   snaps here and never blends across it.
 - **end**: the body leaves the world at this time. It has no record.
@@ -172,9 +186,10 @@ What a reel guarantees:
 A reel closes at the end of the first step that brings it to the size cap, or that brings its span to the maximum
 time, whichever comes first. It does not close earlier than the minimum time span unless the cap forces it: the cap
 wins, so a player can size its buffers from the cap. A step's keys never split across reels. The manifest records the
-limits; the defaults are a 512 KB cap, 1 s minimum and 5 min maximum. The maximum bounds what a crash loses and how
-long a live reader waits in a quiet period. The cap must stay well above the carry-in cost: 1,000 live bodies cost
-about 50 KB of table rows and carry-in keys per reel before their records.
+limits; the defaults are a 512 KB cap, 1 s minimum and 8.5 min maximum. The maximum bounds what a crash loses and how
+long a live reader waits in a quiet period, and it can never exceed what a reel's `u32` ticks cover: 524,288 steps,
+8.7 minutes at 1000 Hz. The cap must stay well above the carry-in cost: 1,000 live bodies cost about 40 KB of table
+rows and carry-in keys per reel before their records.
 
 The writer appends a record to its type's open part when its segment opens (once 2 or 3 samples confirm the formula),
 so every record written while reel k is open belongs to reel k's range. Segmenting decides a few steps after the
@@ -191,7 +206,7 @@ deletes its oldest parts; `reels.bin` shows which reels that leaves unplayable.
 ## Events
 
 `events.bin` holds what analysis needs about each transition and playback does not: per event the body, channel,
-time (step and fraction), Δv, impulse, the axis the time was found on, the other body or part, the slop-corrected
+time (a `u64` tick count from step 0), Δv, impulse, the axis the time was found on, the other body or part, the slop-corrected
 flag, and a range in `event-samples.bin`: the steps around it with position, rotation, linear velocity and angular
 velocity, in the export's sample layout.
 
@@ -216,14 +231,15 @@ Two rules keep every body where it belongs whatever the playback time does:
    position from one frame to the next.
 2. **Every body checks its key on every frame**, resting or not.
 
-Per frame, for each body and channel, with `c` its cursor in its slice:
+Per frame, the player turns its playback time into ticks from the current reel's first step, `T`. Then for each body
+and channel, with `c` its cursor in its slice:
 
 ```
-if the slice is empty, or t is before its first key:    hidden
-move c forward while the next key's time <= t, back while key c's time > t
+if the slice is empty, or T is before its first key's tick:    hidden
+move c forward while the next key's tick <= T, back while key c's tick > T
     (binary search the slice after a jump)
-if key c is an end key:                                  hidden
-otherwise: visible, evaluate key c's record at t - key c's time
+if key c is an end key:                                        hidden
+otherwise: visible, evaluate key c's record at τ = (T - key c's tick) / (8192 × hz)
 ```
 
 At a reel change, for sequential play or a jump:
@@ -246,7 +262,7 @@ together. Translation and rotation write separate components that a final job co
   segmenter's tolerances, and a raw segment reproduces them exactly. This is the writer's test, run against
   motion-export output.
 - **Invariants a player can assert**: every body was checked this frame, and its key c satisfies
-  `time(c) <= t < time(c + 1)`.
+  `tick(c) <= T < tick(c + 1)`.
 - **Reel invariants a reader can assert**: each slice is in time order, a body alive at the start begins with a
   carry-in at the reel's start time, every key's record lies inside its type's range, keys after an end key do not
   exist, and the reel is within the cap.
