@@ -76,3 +76,5 @@ checked against.
 ## Size
 
 A sample is 53 bytes. At 100 Hz a moving body is 5.3 KB a second; a body at rest is nothing.
+
+A recording for playback stores this motion as segments instead of samples: [motion-recording.md](motion-recording.md).
