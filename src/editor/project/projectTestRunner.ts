@@ -193,8 +193,8 @@ export function runProjectTest(
   // stepping at another one validates a different machine: sensors sampled coarser or finer, PLC
   // outputs landing a different number of milliseconds after the input that caused them.
   const world = new SimWorld(Jolt, scene, { hz, ...(opts?.flowFacts === false ? { flowFacts: false } : {}) })
-  // what onFrame may ask beyond the frame, each read only when asked (the cargo snapshots' contacts)
-  const frameExtras: FrameExtras = { contacts: () => world.cargoContacts() }
+  // what onFrame may ask beyond the frame, each read only when asked (the cargo snapshots' contacts, the motion export)
+  const frameExtras: FrameExtras = { contacts: () => world.cargoContacts(), motion: () => world.motionStep() }
   // The scan time Play uses: the project's own (what the editor loads, sceneFile.ts), or the editor's default when it
   // saved none. A spec's scanMs overrides it. The program runs from its own table if it has one, else a default
   // table at this time.

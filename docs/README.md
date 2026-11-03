@@ -43,6 +43,8 @@ with a real PLC are on the website at [/guides/](https://www.openindustryproject
 - [Annotations](annotations.md) - labels pinned to a place in the scene, optionally showing a live PLC tag
 - [Simulation clock](sim-clock.md) - keeping physics and the PLC on one clock
 - [Project tests](project-tests.md) - regression tests for a project's control logic
+- [Motion export](motion-export.md) - every moving cargo body's pose and velocities per step, for outside analysis
+- [Motion recording](motion-recording.md) - a run's cargo motion as segments and keyframes, for playback
 
 ## PLC
 
