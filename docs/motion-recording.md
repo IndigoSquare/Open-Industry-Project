@@ -8,7 +8,9 @@ the segment formulas rely on, is pinned by [joltIntegration.test.ts](../src/sim/
 
 ## Model
 
-- A body's motion has four **channels**: translation along X, along Y and along Z, and rotation. Each is a chain of
+- The recording is laid out for a player's fixed pool of entities: its rows and channels belong to **slots**, each
+  showing one body at a time and many over a recording (see Slots).
+- A slot has five **channels**: visibility, translation along X, along Y and along Z, and rotation. Each is a chain of
   **segments**. Translation is split by axis because the axes change independently: a box bouncing as it slides
   changes Y at every bounce and X not at all, and one noisy axis does not force the others onto raw steps. Rotation is
   one channel, because rotations about different axes do not add independently.
@@ -17,9 +19,9 @@ the segment formulas rely on, is pinned by [joltIntegration.test.ts](../src/sim/
 - Records of one type all have the same size and live in that type's **type file**, split into numbered parts, so a
   reader loads a type's records into one array and finds record `i` at `i × size`. The three translation channels
   share the translation types and their files.
-- **Reels** divide the run in time. A reel holds, for each body present, its **carry state** (where every channel
-  stands when the body enters the reel) and its keys for the changes inside the reel, each channel's in a slice of
-  its own, and for each type the one contiguous range of records those keys use. A reel is a unit of this file format
+- **Reels** divide the run in time. A reel holds a row for every slot, with its **carry state** (where every channel
+  stands at the reel's start) and its keys for the changes inside the reel, each channel's in a slice of its own, and
+  for each type the one contiguous range of records those keys use. A reel is a unit of this file format
   only. It is unrelated to the chunks Unity's Entities package stores entities in.
 
 ## Files
@@ -28,10 +30,10 @@ A recording is a folder, `<name>.oipmotion/`:
 
 | File | Holds |
 |---|---|
-| `manifest.json` | format version, step rate, step count, units and axes, the position origin and quantum, the type table (name, file stem, record size), reel and part limits, the compression of each part, and once the recording is finished each type's largest range in any reel |
-| `bodies.bin` | one row per body in the recording |
+| `manifest.json` | format version, step rate, step count, units and axes, the position origin and quantum, the type table (name, file stem, record size), reel and part limits, the compression of each part, the pool size N and the reel cap, and once the recording is finished each type's largest range in any reel |
+| `bodies.bin` | one row per body in the recording, with the slot the writer gave it |
 | `reels.bin` | the reel table, one row per reel, appended as each reel closes |
-| `index.bin` | the reels: each one's body table, with carry states, and keys |
+| `index.bin` | the reels: each one's slot rows, with carry states, and keys |
 | `seg-<type>.<part>.bin`, `rot-<type>.<part>.bin` | one series of parts per segment type, e.g. `seg-linear.000.bin` |
 | `events.bin` | the transitions between segments, for analysis |
 | `event-samples.bin` | the step samples around each event, with velocities, for analysis |
@@ -113,15 +115,15 @@ u32  packed     bits  0-23  record   index into this reel's range of that type's
 The key is two `u32`, so a reader in any language takes it without 64-bit arithmetic. 24 bits of record index is
 16,777,215 records in one reel's range, far above what the size cap allows of the smallest record (4 bytes).
 
-- **jump**: the value does not continue from the previous segment (a teleport, a hold taking the body). A player
-  snaps here and never blends across it.
+- **jump**: the value does not continue from the previous segment (a teleport, a hold taking the body, a slot showing a
+  new body). A player snaps here and never blends across it.
 - **slop-corrected**: the start time was moved back by the penetration slop over the closing speed (an impact the
   speculative contact did not catch, see joltIntegration.test.ts).
 
 ## Segment types
 
 Every record's time origin is its key's time: `τ = t - t_key`. Rates and positions in formula records are float32;
-quaternions are packed. There are 13 types, 5 translation and 8 rotation, within the key's 16.
+quaternions are packed. There are 15 types, 2 visibility, 5 translation and 8 rotation, within the key's 16.
 
 ### Translation, per axis
 
@@ -196,7 +198,7 @@ round, a near full turn between two near equal orientations, and a curve through
 chooses every stored quaternion's sign to continue from the one before it: it stores `-q` when `q · previous < 0`.
 That holds for each raw step against the step before it, for each segment's `q₀` against where the previous segment
 ends (a spin past one turn ends at `-q₀`, and the next segment continues from that), and for each carry state against
-where the body stands at the end of the previous reel. The packed sign bit carries the chosen sign through packing. A
+where the slot stands at the end of the previous reel. It does not hold across a jump, where a slot takes a new body. The packed sign bit carries the chosen sign through packing. A
 reader can then interpolate between any two neighbouring stored values directly.
 
 ### Raw segments
@@ -211,7 +213,7 @@ packing's precision.
 - It starts and ends on whole steps: its key's tick is a multiple of 256, and the writer moves the start of the
   segment after it to a whole step too. Its records run from its start step to the next key's step inclusive, so the
   last record is the next segment's starting value and the count is `(nextKey.tick - start) / 256 + 1`. A raw segment
-  before the body ends stops at its end step.
+  before its slot is hidden stops at that step.
 - Between steps it is linear only. With `u = (t - t_start) × hz`, `n = floor(u)` and `a = u - n`, on the decoded
   values:
   - position: `p[n] + (p[n+1] - p[n]) × a`
@@ -224,13 +226,28 @@ packing's precision.
 
 At 100 Hz a raw axis costs 0.4 KB a second and a raw rotation 0.8 KB.
 
+## Slots
+
+A player draws the recording with a fixed pool of entities, created once before playing and reused as bodies come and
+go. The recording is laid out for that pool: its rows and channels belong to **slots**, not to bodies.
+
+- The **pool size** N is the most bodies present at once anywhere in the recording, and the manifest records it. Every
+  reel has exactly N rows, and row i is slot i.
+- When a body appears, the writer gives it the lowest free slot; when it leaves, the slot is free again. A slot shows
+  one body at a time and many bodies over a recording.
+- The writer needs N when it opens the recording, since every reel's rows depend on it. A headless run can count it
+  with a first pass, because a headless run of a project repeats exactly. A live recording is given N as a setting;
+  a body that arrives when every slot is taken is not recorded, and `events.bin` records the overflow.
+- Which body a slot shows at a given time is not part of the rows or keys, and is to be specified separately.
+  `bodies.bin` records each body's slot, spawn and end as the writer assigned them, for analysis.
+
 ## Bodies
 
-`bodies.bin` lists every body in the recording, so a player can create all of them before playing:
+`bodies.bin` lists every body in the recording:
 
 ```
 u32 count
-per body: u32 id, f32 mass, f32 linearDamping, f32 angularDamping, f32 halfX, halfY, halfZ,
+per body: u32 id, u32 slot, f32 mass, f32 linearDamping, f32 angularDamping, f32 halfX, halfY, halfZ,
           u32 spawnStep, u32 endStep (0xffffffff if it never leaves), string product, string partId
 ```
 
@@ -243,7 +260,6 @@ A string is a u16 byte count and UTF-8 bytes. Ids are OIP frame ids: stable for 
 ```
 u32 firstStep, u32 lastStep
 u64 offset, u32 length            the reel in index.bin
-u32 cap                           the reel's size cap in bytes
 per type, in manifest order: u16 part, u32 byteOffset, u32 byteLength, u32 recordCount
 ```
 
@@ -253,26 +269,33 @@ per type, in manifest order: u16 part, u32 byteOffset, u32 byteLength, u32 recor
 A reel in `index.bin`:
 
 ```
-u32 bodyCount, u32 keyCount
-bodies[bodyCount], 148 bytes each, in ascending bodyId order:
-  u32 bodyId          the OIP frame id, as in bodies.bin; each at most once per reel
-  u32 startTick       0 if alive at the reel's start, else the tick it spawns at
-  u32 endTick         the tick it leaves at, 0xffffffff if it is still there at the reel's end
-  u8  flags, u8×3 0   flags: 1 jump at start (it did not continue from the previous reel's pose)
-  per channel (x, y, z, rotation): u32 first, u32 count     its slice of keys
+u32 keyCount
+slots[N], 144 bytes each, row i is slot i:
+  u8  flags, u8×3 0   flags: 1 shown at the reel's start, 2 jump at start (it did not continue from the previous
+                      reel's pose)
+  per channel (visibility, x, y, z, rotation): u32 first, u32 count     its slice of keys
   carry state, 100 bytes
-keys[keyCount]       grouped by body and channel, each slice in time order
+keys[keyCount]       grouped by slot and channel, each slice in time order
 ```
 
-The rows are sorted by body id, so a reader finds one body's row by binary search, and the reel apply pass reads the
-bodies in the same order each reel, in step with an entity array that is in id order too.
+### Visibility channel
+
+Visibility is a channel with its own key slice, checked like the others. It has two types, **shown** and **hidden**,
+which carry no record (the key's record field is 0). Its state at the reel's start is flag 1 of the row. A slot can be
+shown and hidden any number of times in a reel.
+
+- While a slot is hidden its motion channels are not evaluated, and their state is ignored.
+- When a slot is shown with a body that did not stand there a moment before (a new body, or one the slot did not
+  show), the writer puts, at the same tick as the shown key, one key in each motion channel with that body's starting
+  state, flagged **jump**. Nothing blends across it.
+- When a slot is hidden, its motion channels need no keys.
 
 ### Carry state
 
-Where every channel stands at the body's `startTick`: the reel's start for a body already alive, its spawn for one
-that appears in the reel. Each channel's segment is re-anchored there (coefficients evaluated at that time), so the
-carry state is valid from `startTick` until the channel's first key in the reel, or to the body's end when the slice
-is empty.
+Where every motion channel stands at the reel's start, for a slot shown then. Each channel's segment is re-anchored
+there (coefficients evaluated at that time), so the carry state is valid from the reel's start until the channel's
+first key in the reel, or to the reel's end when the slice is empty. For a slot hidden at the reel's start it is all
+zero.
 
 ```
 translation, per axis (x, then y, then z), 20 bytes each:
@@ -291,45 +314,42 @@ rotation, 40 bytes:
                       raw: r0 holds the u32 index of its first record in this reel's rot-raw range
 ```
 
-A body whose channels do not change in the reel has empty slices: its carry state covers the whole reel. A body at
-rest or riding a belt steadily costs its 148-byte row and nothing else.
+A slot whose channels do not change in the reel has empty slices: its row covers the whole reel. A slot that rests,
+rides a belt steadily or stays hidden costs its 144-byte row and nothing else.
 
 ### What a reel guarantees
 
-1. **Every body present has a row**, and for any time in the reel the row says exactly one of: not there yet
-   (before `startTick`), gone (at or after `endTick`), or in one segment per channel, the carry state's or a key's.
-2. **No reel needs an earlier one**: the carry state holds every channel's state at the body's start in the reel.
+1. **Every slot has a row**, and for any time in the reel the row says either hidden, or shown with one segment per
+   motion channel, the carry state's or a key's.
+2. **No reel needs an earlier one**: the row holds every channel's state at the reel's start.
 3. **Each type's records form one contiguous range in one part.** A raw segment carried in has its records from the
    reel's start step, the first being the step record the previous reel ends with. A raw segment that runs past a
    reel's end has its records to the first step at or after that end in the reel, so its last interval can be drawn
    without the next reel. Loading a reel is one read of its index bytes and one read per type.
-4. **A body not listed is not in the world** for the whole reel.
-5. **A reel is never larger than its cap**, counting its index bytes and its records before compression, except a
+4. **A reel is never larger than the cap**, counting its index bytes and its records before compression, except a
    reel of a single step whose keys alone exceed it.
 
 ### When a reel closes
 
-A reel closes at the end of the first step that brings it to its size cap, or that brings its span to the maximum
+A reel closes at the end of the first step that brings it to the size cap, or that brings its span to the maximum
 time, whichever comes first. It does not close earlier than the minimum time span unless the cap forces it. A step's
 keys never split across reels.
 
-Each reel's cap is set when it opens, from the bodies present then:
+Every reel carries all N rows, so the cap follows the pool size and is the same for every reel of a recording:
 
 ```
-cap = max(minimumCap, bodiesPresent × 148 × rowFactor)
+cap = max(minimumCap, N × 144 × rowFactor)
 ```
 
-Every body present repeats its 148-byte row in every reel, so a fixed cap would leave a large scene's reels mostly
-rows (3,000 bodies fill 87% of a 512 KB reel before any keys). Scaling the cap with the body count keeps the rows to
-at most `1 / rowFactor` of a reel at any scene size, while a small cell keeps small reels. The defaults are a 512 KB
-minimum cap, a row factor of 8, a 1 s minimum span and an 8.5 min maximum, recorded in the manifest; they are starting
-values to tune with the measurements under Checks. With them, 100 bodies give 512 KB reels, 1,000 give 1.2 MB and
-10,000 give 12 MB. The maximum span bounds what a crash loses and how long a live reader waits in a quiet period,
-whatever the cap. The reel table records each reel's cap.
+That keeps the rows to at most `1 / rowFactor` of a reel at any pool size, while a small cell keeps small reels. The
+defaults are a 512 KB minimum cap, a row factor of 8, a 1 s minimum span and an 8.5 min maximum, recorded in the
+manifest with the cap they give; they are starting values to tune with the measurements under Checks. With them, a pool
+of 100 gives 512 KB reels, 1,000 gives 1.2 MB and 10,000 gives 11.5 MB. The maximum span bounds what a crash loses and
+how long a live reader waits in a quiet period, whatever the cap.
 
 Uncompressed, the writer appends a record to its type's open part when its segment opens (once 2 or 3 samples
 confirm the formula), so every record written while reel k is open belongs to reel k's range. Compressed, it holds the
-reel's records, at most its cap, and writes each type's range as one frame when the reel closes. Segmenting decides a
+reel's records, at most the cap, and writes each type's range as one frame when the reel closes. Segmenting decides a
 few steps after the fact (up to the raw-fallback window, about 15 steps), so a reel closes only once the segmenter has
 decided every step up to the reel's end.
 
@@ -350,11 +370,12 @@ CPU when a reel loads and nothing during playback.
 
 ## Events
 
-`events.bin` holds what analysis needs about each transition and playback does not: per event the body, the channels
-it changed, its time (a `u64` tick count from step 0), Δv per axis, impulse, the axis the time was found on, the other
-body or part, the slop-corrected flag, whether the body left the recorded volume, and a range in `event-samples.bin`:
-the steps around it with position, rotation, linear velocity and angular velocity as float32, in the export's sample
-layout. These stay unpacked because residuals and impulses are measured at the 10 µm level.
+`events.bin` holds what analysis needs about each transition and playback does not: per event the body and its slot,
+the channels it changed, its time (a `u64` tick count from step 0), Δv per axis, impulse, the axis the time was found
+on, the other body or part, the slop-corrected flag, whether the body left the recorded volume or found no free slot,
+and a range in `event-samples.bin`: the steps around it with position, rotation, linear velocity and angular velocity
+as float32, in the export's sample layout. These stay unpacked because residuals and impulses are measured at the
+10 µm level.
 
 ## Reading
 
@@ -362,51 +383,52 @@ A player keeps two buffers per type, current and next, plus two for the index by
 the whole playback, so memory stays flat however long the recording is. A finished recording's manifest gives each
 type's largest range in any reel, which sizes its buffers. While a recording is still being written, a reader sizes
 them from each reel's row in the reel table as it arrives, growing a buffer when a reel needs more, so memory follows
-the largest reel seen so far.
+the largest reel seen so far. The index buffers are sized from the cap.
 
 - while reel k plays, current holds its ranges and next is filled with reel k + 1's in the background;
 - at the boundary the two swap, and the old current becomes the next one to fill;
 - a jump fills the spare with the target reel, then swaps.
 
-A reel whose single step exceeds its cap is the one case where a buffer grows. A reader grows it once rather than
-fail. Packed records stay packed in the buffers and are decoded when a key copies them into a body's state.
+A reel whose single step exceeds the cap is the one case where a buffer grows. A reader grows it once rather than
+fail. Packed records stay packed in the buffers and are decoded when a key copies them into a slot's state.
 
 ## Playback
 
-Two rules keep every body where it belongs whatever the playback time does:
+A player creates N entities, one per slot, before playing, and never creates or destroys one during playback. Two
+rules keep every slot right whatever the playback time does:
 
 1. **A pose is a function of the time and each channel's current segment only**: `f(coefficients, t - t_start)`.
    Never accumulate a value from one frame to the next.
-2. **Every body checks every channel on every frame**, resting or not.
+2. **Every slot checks every channel on every frame**, shown or hidden, moving or resting.
 
-### A body's state
+### A slot's state
 
-Each body holds, per channel, the segment in force:
+Each slot holds, per channel, the segment in force:
 
 ```
 start, next       ticks: the segment holds for start <= T < next
-type              its type
-coefficients      decoded: c0..c3 for an axis, q₀ and rates for rotation
+type              its type (for visibility: shown or hidden)
+coefficients      decoded: c0..c3 for an axis, q₀ and rates for rotation; none for visibility
 raw index         for a raw segment, its first record in the current reel's range
 cursor            its position in the channel's key slice
 ```
 
-`next` is the channel's next key's tick, or the body's `endTick` when no key follows. Coefficients live with the body,
-copied from a record when its key comes due, so evaluation reads the body's own state and touches the type buffers
-only for raw segments.
+`next` is the channel's next key's tick, or the reel's end when no key follows. Coefficients live with the slot,
+copied from a record when its key comes due, so evaluation reads the slot's own state and touches the type buffers only
+for raw segments.
 
 ### Per frame
 
-The player turns its playback time into ticks from the current reel's first step, `T`. Then, for every body:
+The player turns its playback time into ticks from the current reel's first step, `T`. Then, for every slot:
 
 ```
-if T < startTick or T >= endTick:                          hidden
-for each channel:
+for each channel, visibility first:
     if start <= T < next:                                  still valid: nothing to look up
     else move the cursor forward or back to the key with tick <= T < next key's tick
-         (binary search the slice after a jump; before the first key, the carry state),
+         (binary search the slice after a jump; before the first key, the row's carry state),
          copy that key's record into the channel's state
-visible: evaluate each channel at τ = (T - start) / (256 × hz), combine into the pose
+if visibility is hidden:                                   hide the entity
+else: show it, evaluate each motion channel at τ = (T - start) / (256 × hz), combine into the pose
 ```
 
 ### At a reel change
@@ -414,38 +436,40 @@ visible: evaluate each channel at τ = (T - start) / (256 × hz), combine into t
 For sequential play or a jump:
 
 1. swap in the preloaded next reel, or load the reel containing t (binary search `reels.bin` by first step);
-2. **clear** every body to hidden, so a body the new reel does not list hides instead of keeping its pose;
-3. **apply** the reel's rows: each listed body's start and end ticks, slices with cursors before their first key, and
-   its carry state copied into every channel's state (decoded once here);
-4. run the per-frame check, which places every body, and write every body's pose once.
+2. **apply** all N rows: each slot's visibility from its flags, its slices with cursors before their first key, and
+   its carry state copied into every motion channel's state (decoded once here);
+3. run the per-frame check, which places every slot, and write every slot's pose and visibility once.
 
-A player shows the last complete frame while a jump's reel loads, never a frame with some bodies updated.
+Every slot has a row in every reel, so applying the rows sets every entity and none can keep a stale pose. A player
+shows the last complete frame while a jump's reel loads, never a frame with some slots updated.
 
 ### Making the per-frame check cheap
 
-The check runs for every body every frame; these keep it to microseconds with thousands of bodies.
+The check runs for every slot every frame; these keep it to microseconds with thousands of slots.
 
-- **Tight interval arrays.** Keep each channel's `start` and `next` for all bodies in their own arrays, and run the
+- **Tight interval arrays.** Keep each channel's `start` and `next` for all slots in their own arrays, and run the
   check as a compiled parallel loop over them (a Burst job in Unity). Two integer comparisons per channel, which a
-  compiler turns into SIMD over several bodies at once. Only channels that fail it go on to move a cursor.
+  compiler turns into SIMD over several slots at once. Only channels that fail it go on to move a cursor.
 - **A transition list per reel.** A reel's keys are known when it loads. Sort them by tick into one array of
-  `(tick, body, channel)`; in forward play one pointer walks it, and each frame applies the keys with `tick <= T`
-  directly. The work then follows how many channels change, not how many bodies exist. It feeds the updates; the
-  interval check still confirms every body.
-- **A bound per group of bodies.** Keep, for each block of bodies stored together (an ECS chunk in Unity), the smallest
-  `next` among them. While T is below it in forward play, every body in the block is proven valid by one comparison.
-- **Write on change.** Evaluate every visible body, but write its pose only when it changed. A resting body writes once
-  when its segment starts, so the renderer re-uploads only what moved. The reel apply step writes every body once.
-- **No structural changes.** Switching a body's segment type changes its state's fields, never its set of
-  components, so an ECS engine never moves it between chunks.
-- **No per-body coroutines or callbacks.** Managed per-object stepping or a delegate per key costs more than the check
-  it replaces, runs on one thread, and leaves a body with no pending callback unchecked. The transition list gives the
+  `(tick, slot, channel)`; in forward play one pointer walks it, and each frame applies the keys with `tick <= T`
+  directly. The work then follows how many channels change, not how many slots exist. It feeds the updates; the
+  interval check still confirms every slot.
+- **A bound per group of slots.** Keep, for each block of slots stored together (an ECS chunk in Unity), the smallest
+  `next` among them. While T is below it in forward play, every slot in the block is proven valid by one comparison.
+- **Write on change.** Evaluate every shown slot, but write its pose only when it changed, and its visibility only when
+  it changed. A resting slot writes once when its segment starts, so the renderer re-uploads only what moved. The reel
+  apply step writes every slot once.
+- **No structural changes.** Showing and hiding are a change of state (an enableable component or a render flag in
+  Unity), and switching segment type changes a slot's fields, never its set of components, so an ECS engine never moves
+  an entity between chunks.
+- **No per-slot coroutines or callbacks.** Managed per-object stepping or a delegate per key costs more than the check
+  it replaces, runs on one thread, and leaves a slot with no pending callback unchecked. The transition list gives the
   same effect as data.
 
-In Unity, a frame is: the key-check job over all bodies (interval arrays, then the transition list), one evaluation job
-over the bodies' channel states, and a final job that combines translation and rotation into the transform and writes
-the ones that changed. In debug builds an assertion pass confirms every visible body satisfies `start <= T < next` on
-every channel.
+In Unity, a frame is: the key-check job over all slots (interval arrays, then the transition list), one evaluation job
+over the shown slots' channel states, and a final job that combines translation and rotation into the transform and
+writes the poses and visibility that changed. In debug builds an assertion pass confirms every slot satisfies
+`start <= T < next` on every channel.
 
 ## Checks
 
@@ -454,18 +478,19 @@ every channel.
   0.0002°. This is the writer's test, run against motion-export output.
 - **Packing**: encoding then decoding a position lands within half a quantum, a rotation within the packing's error,
   and a quaternion of either sign decodes to the same quaternion, sign included.
-- **Sign continuity**: every stored quaternion has a non-negative dot product with the one before it in its channel,
-  across steps, segments and reels.
-- **Carry state**: a body's carry state evaluated at `startTick` matches where the previous reel's segments put it at
-  that time, within the packing's precision, unless its row has the jump flag.
-- **Invariants a player can assert**: every visible body was checked this frame, and every channel satisfies
+- **Sign continuity**: every stored quaternion has a non-negative dot product with the one before it in its slot's
+  channel, across steps, segments and reels, except across a jump.
+- **Carry state**: a shown slot's carry state evaluated at the reel's start matches where the previous reel's segments
+  put it at that time, within the packing's precision, unless its row has the jump flag.
+- **Slots**: no two bodies hold a slot at once, the most bodies shown at any time is at most N, and every shown key
+  that brings a new body is followed at the same tick by a jump key in each motion channel.
+- **Invariants a player can assert**: every slot was checked this frame, and every channel satisfies
   `start <= T < next`.
-- **Reel invariants a reader can assert**: the rows are in strictly ascending body id order, each slice is in time
-  order and lies within the body's start and end, every key's record lies inside its type's range, and the reel is
-  within its cap.
+- **Reel invariants a reader can assert**: there are exactly N rows, each slice is in time order, every key's record
+  lies inside its type's range, and the reel is within the cap.
 - **Tuning the reel limits**: the minimum cap and row factor are measured, not assumed. Record representative runs (a
   small cell, the demo cell with about 1,000 bodies, a large stress scene) and measure:
   1. the time to load and decode the largest reel on the target machine, which must stay well under one frame
      (about 16 ms), since a jump waits for it;
-  2. the share of each reel spent on body rows, against `1 / rowFactor`;
+  2. the share of each reel spent on slot rows, against `1 / rowFactor`;
   3. the recording's total size at a few row factors, to see where a larger factor stops shrinking it.
